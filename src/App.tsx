@@ -625,7 +625,7 @@ export default function App() {
             {shortAddress(admin.address)}
             <Copy size={11} className="copy-icon" />
           </button>
-          <button className="signout-btn" onClick={signOut}><LogOut size={15} />Sign out</button>
+          <button className="signout-btn" onClick={signOut} aria-label="Sign out"><LogOut size={15} />Sign out</button>
         </div>
       </aside>
 
