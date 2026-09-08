@@ -42,15 +42,23 @@ html,
 body,
 #root {
   min-height: 100vh;
+  min-height: 100dvh;
+}
+
+html {
+  overflow-x: hidden;
 }
 
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   font-size: 14px;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
 }
 
 button,
@@ -61,6 +69,7 @@ input {
 button {
   cursor: pointer;
   color: inherit;
+  -webkit-tap-highlight-color: transparent;
 }
 
 a {
@@ -260,6 +269,45 @@ p {
 /* ------------------------------------------------------------------ */
 /* Sign-in screen                                                      */
 /* ------------------------------------------------------------------ */
+
+.crash-shell {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px;
+  background: var(--canvas);
+}
+
+.crash-card {
+  width: min(100%, 420px);
+  padding: 32px 28px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.crash-card svg {
+  color: var(--danger);
+  margin-bottom: 12px;
+}
+
+.crash-card h1 {
+  margin-bottom: 10px;
+  font-size: 22px;
+  letter-spacing: -0.4px;
+}
+
+.crash-card p {
+  margin-bottom: 22px;
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+
+.crash-card .btn {
+  width: 100%;
+}
 
 .auth-shell {
   display: grid;
@@ -886,6 +934,12 @@ p {
   display: flex;
   gap: 26px;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.range-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .range-tabs button {
@@ -1449,6 +1503,18 @@ p {
 /* Responsive                                                          */
 /* ------------------------------------------------------------------ */
 
+@media (hover: none) {
+  .operator-address .copy-icon {
+    opacity: 0.7;
+  }
+
+  .kpi:hover,
+  .wallet-row:hover,
+  .match-card:hover {
+    box-shadow: none;
+  }
+}
+
 @media (max-width: 1120px) {
   .kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1462,11 +1528,12 @@ p {
 @media (max-width: 980px) {
   .auth-shell {
     grid-template-columns: minmax(0, 1fr);
+    min-height: 100dvh;
   }
 
   .auth-hero {
-    gap: 34px;
-    padding: 34px 30px;
+    gap: 28px;
+    padding: 28px 24px;
   }
 
   .auth-hero::before {
@@ -1474,12 +1541,13 @@ p {
   }
 
   .hero-inner h1 {
-    font-size: 34px;
+    font-size: clamp(28px, 8vw, 34px);
+    letter-spacing: -1px;
   }
 
   .hero-points {
-    margin-top: 26px;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    margin-top: 22px;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .app-shell {
@@ -1487,24 +1555,45 @@ p {
   }
 
   .sidebar {
-    position: static;
+    position: sticky;
+    top: 0;
+    z-index: 20;
     display: grid;
     grid-template-columns: auto 1fr auto;
+    grid-template-areas: "brand nav actions";
     align-items: center;
-    gap: 18px;
-    padding: 14px 18px;
+    gap: 12px;
+    padding: 12px 16px;
+    padding-top: max(12px, env(safe-area-inset-top));
+  }
+
+  .side-brand {
+    grid-area: brand;
+    padding: 0;
+    min-width: 0;
   }
 
   .side-nav {
+    grid-area: nav;
     display: flex;
     justify-content: flex-end;
     gap: 2px;
     margin: 0;
+    min-width: 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .side-nav::-webkit-scrollbar {
+    display: none;
   }
 
   .side-nav a {
+    flex: none;
     border-left: 0;
     border-bottom: 2px solid transparent;
+    white-space: nowrap;
   }
 
   .side-nav a.active {
@@ -1521,6 +1610,7 @@ p {
   }
 
   .side-bottom {
+    grid-area: actions;
     display: flex;
     align-items: center;
     justify-content: flex-end;
@@ -1541,7 +1631,10 @@ p {
 
   .signout-btn {
     width: auto;
+    min-width: 44px;
+    min-height: 44px;
     padding: 8px 10px;
+    justify-content: center;
     font-size: 0;
   }
 
@@ -1551,18 +1644,46 @@ p {
   }
 }
 
+@media (max-width: 720px) {
+  .sidebar {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "brand actions"
+      "nav nav";
+    gap: 8px 12px;
+  }
+
+  .side-nav {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .side-nav a {
+    flex: 1;
+    justify-content: center;
+    min-height: 44px;
+    padding: 8px 6px;
+    font-size: 12px;
+  }
+}
+
 @media (max-width: 620px) {
   .content {
-    padding: 28px 16px 50px;
+    padding: 22px 16px max(40px, env(safe-area-inset-bottom));
   }
 
   .content-head {
     flex-direction: column;
-    gap: 16px;
+    gap: 12px;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .status {
-    display: none;
+    display: flex;
   }
 
   .toolbar {
@@ -1574,6 +1695,12 @@ p {
 
   .range-tabs {
     width: 100%;
+    gap: 18px;
+  }
+
+  .range-tabs button {
+    min-height: 44px;
+    padding: 10px 0 12px;
   }
 
   .updated {
@@ -1587,24 +1714,36 @@ p {
   }
 
   .kpi {
-    padding: 15px;
+    padding: 14px;
+    min-width: 0;
+  }
+
+  .kpi-top {
+    font-size: 10px;
   }
 
   .kpi > strong {
-    font-size: 21px;
+    font-size: clamp(16px, 5.5vw, 21px);
+    margin: 12px 0 6px;
   }
 
   .panel {
-    padding: 18px;
+    padding: 16px;
+  }
+
+  .panel-heading {
+    margin-bottom: 18px;
+    gap: 8px;
   }
 
   .bar-row {
-    grid-template-columns: 108px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
   }
 
   .bar-row > strong {
-    grid-column: 2;
-    margin-top: -6px;
+    grid-column: 1;
+    margin-top: 0;
     text-align: left;
   }
 
@@ -1615,14 +1754,63 @@ p {
   .connect-btn {
     width: 100%;
     justify-content: center;
+    min-height: 44px;
   }
 
-  .auth-hero {
-    padding: 26px 22px;
+  .auth-shell {
+    display: flex;
+    flex-direction: column;
   }
 
   .auth-card-wrap {
-    padding: 20px 16px 34px;
+    order: -1;
+    padding: 18px 16px max(28px, env(safe-area-inset-bottom));
+  }
+
+  .auth-card {
+    padding: 22px 18px;
+    width: 100%;
+  }
+
+  .auth-card h2 {
+    font-size: 22px;
+  }
+
+  .auth-hero {
+    padding: 22px 18px max(28px, env(safe-area-inset-bottom));
+    gap: 18px;
+  }
+
+  .hero-inner h1 {
+    font-size: 26px;
+    margin-bottom: 12px;
+  }
+
+  .hero-copy {
+    font-size: 13.5px;
+    line-height: 1.65;
+  }
+
+  .hero-points {
+    margin-top: 16px;
+    gap: 10px;
+  }
+
+  .search-input {
+    flex-wrap: wrap;
+    padding: 10px 10px 10px 12px;
+    gap: 8px;
+  }
+
+  .search-input input {
+    flex: 1 1 140px;
+    font-size: 16px;
+    min-height: 28px;
+  }
+
+  .search-input button[type="submit"] {
+    width: 100%;
+    min-height: 44px;
   }
 
   .match-field {
@@ -1632,5 +1820,31 @@ p {
 
   .match-field dt {
     width: auto;
+  }
+
+  .empty-actions {
+    flex-direction: column;
+  }
+
+  .empty-actions .btn {
+    width: 100%;
+  }
+
+  .wallet-empty {
+    padding: 22px 16px 18px;
+  }
+}
+
+@media (max-width: 400px) {
+  .kpi-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .side-brand span {
+    display: none;
+  }
+
+  .side-nav a.coming-soon .soon-badge {
+    display: none;
   }
 }

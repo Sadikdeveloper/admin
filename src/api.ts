@@ -10,7 +10,19 @@ export type UserGroup = { key: string; label: string; periods: { period: string;
 export type Overview = { meta: { generatedAt: string; timezone: string; fx: { usdToNgn: number | null; degraded: boolean; asOf: string | null; source: string | null }; notes?: string[] }; transactions: { totals: Group; byCategory: Group[] }; deposits: { totals: Group; byCategory: Group[] }; topups: { totals: Group; byCategory: Group[] }; providers: { name: string; code: string; providerKind: string; categories: string[]; periods: PeriodMetric[] }[]; users: UserGroup[] };
 export type SearchResult = { query: string; matches: Array<Record<string, unknown>> };
 
-export const session = { get access() { return localStorage.getItem(accessKey); }, get refresh() { return localStorage.getItem(refreshKey); }, set(data: { accessToken: string; refreshToken: string }) { localStorage.setItem(accessKey, data.accessToken); localStorage.setItem(refreshKey, data.refreshToken); }, clear() { localStorage.removeItem(accessKey); localStorage.removeItem(refreshKey); } };
+export const session = {
+  get access() { return localStorage.getItem(accessKey); },
+  get refresh() { return localStorage.getItem(refreshKey); },
+  set(data: { accessToken?: string; refreshToken?: string }) {
+    if (!data?.accessToken || !data?.refreshToken) return;
+    localStorage.setItem(accessKey, data.accessToken);
+    localStorage.setItem(refreshKey, data.refreshToken);
+  },
+  clear() {
+    localStorage.removeItem(accessKey);
+    localStorage.removeItem(refreshKey);
+  },
+};
 
 /**
  * Converts technical error messages from the server into
@@ -64,6 +76,13 @@ function friendlyApiError(status: number, serverMessage: string | undefined): st
   }
 }
 
+function unwrap<T>(body: { data?: T } | T | null | undefined): T {
+  if (body && typeof body === 'object' && 'data' in body && (body as { data?: T }).data !== undefined) {
+    return (body as { data: T }).data;
+  }
+  return body as T;
+}
+
 async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set('Content-Type', 'application/json');
@@ -78,8 +97,8 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
 
   if (response.status === 401 && retry && session.refresh) {
     try {
-      const refreshed = await request<{ data: { accessToken: string; refreshToken: string } }>('/admin/auth/refresh', { method: 'POST', body: JSON.stringify({ refreshToken: session.refresh }) }, false);
-      session.set(refreshed.data);
+      const refreshed = await request<{ data: { accessToken: string; refreshToken: string } } | { accessToken: string; refreshToken: string }>('/admin/auth/refresh', { method: 'POST', body: JSON.stringify({ refreshToken: session.refresh }) }, false);
+      session.set(unwrap(refreshed));
       return request<T>(path, init, false);
     } catch {
       session.clear();
@@ -94,9 +113,35 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   return body as T;
 }
 
-export async function getNonce(address: string) { return request<{ data: { message: string } }>('/admin/auth/nonce', { method: 'POST', body: JSON.stringify({ address }) }); }
-export async function verify(message: string, signature: string) { const result = await request<{ data: { accessToken: string; refreshToken: string; admin: Admin } }>('/admin/auth/verify', { method: 'POST', body: JSON.stringify({ message, signature }) }); session.set(result.data); return result.data; }
-export async function getMe() { return request<{ data: Admin }>('/admin/auth/me'); }
-export async function logout() { try { await request('/admin/auth/logout', { method: 'POST' }); } finally { session.clear(); } }
-export async function getOverview(params: { from?: string; to?: string } = {}) { const query = new URLSearchParams({ timezone: 'Africa/Lagos', ...params }).toString(); return (await request<{ data: Overview }>(`/admin/analytics/overview?${query}`)).data; }
-export async function searchTransactions(query: string) { return (await request<{ data: SearchResult }>(`/admin/transactions/search?q=${encodeURIComponent(query)}`)).data; }
+export async function getNonce(address: string) {
+  const result = await request<{ data: { message: string } } | { message: string }>('/admin/auth/nonce', { method: 'POST', body: JSON.stringify({ address }) });
+  return { data: unwrap<{ message: string }>(result) };
+}
+
+export async function verify(message: string, signature: string) {
+  const result = await request<{ data: { accessToken: string; refreshToken: string; admin: Admin } } | { accessToken: string; refreshToken: string; admin: Admin }>('/admin/auth/verify', { method: 'POST', body: JSON.stringify({ message, signature }) });
+  const payload = unwrap<{ accessToken: string; refreshToken: string; admin: Admin }>(result);
+  if (!payload?.accessToken || !payload?.admin) {
+    throw new Error('Sign-in could not be completed. Please try connecting again.');
+  }
+  session.set(payload);
+  return payload;
+}
+
+export async function getMe() {
+  const result = await request<{ data: Admin } | Admin>('/admin/auth/me');
+  return { data: unwrap<Admin>(result) };
+}
+
+export async function logout() {
+  try { await request('/admin/auth/logout', { method: 'POST' }); } finally { session.clear(); }
+}
+
+export async function getOverview(params: { from?: string; to?: string } = {}) {
+  const query = new URLSearchParams({ timezone: 'Africa/Lagos', ...params }).toString();
+  return unwrap<Overview>(await request<{ data: Overview } | Overview>(`/admin/analytics/overview?${query}`));
+}
+
+export async function searchTransactions(query: string) {
+  return unwrap<SearchResult>(await request<{ data: SearchResult } | SearchResult>(`/admin/transactions/search?q=${encodeURIComponent(query)}`));
+}
