@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
   Activity,
@@ -108,9 +108,52 @@ function copyToClipboard(text: string): Promise<void> {
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
 
+export class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('[admin] Render crashed:', error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="crash-shell">
+          <div className="crash-card">
+            <CircleAlert size={22} />
+            <h1>The console hit a snag</h1>
+            <p>Something unexpected happened after sign-in. Reload to try again, or sign out and connect your wallet once more.</p>
+            <button type="button" className="btn btn-primary" onClick={() => window.location.reload()}>
+              <RefreshCw size={15} />
+              Reload console
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              style={{ marginTop: 10 }}
+              onClick={() => {
+                api.session.clear();
+                window.location.reload();
+              }}
+            >
+              <LogOut size={15} />
+              Sign out
+            </button>
+          </div>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const [admin, setAdmin] = useState<api.Admin | null>(null);
-  const [restoring, setRestoring] = useState(false);
+  const [restoring, setRestoring] = useState(() => Boolean(api.session.access));
   const [overview, setOverview] = useState<api.Overview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -242,6 +285,9 @@ export default function App() {
       .getMe()
       .then(r => {
         if (!alive) return;
+        if (!r?.data?.address) {
+          throw new Error('invalid profile');
+        }
         setAdmin(r.data);
         setRestoring(false);
         void loadOverview();
@@ -307,14 +353,21 @@ export default function App() {
 
       const address = accounts[0];
       const challenge = await api.getNonce(address);
+      const message = challenge?.data?.message;
+      if (!message) {
+        throw new Error('The server did not send a sign-in message. Please try connecting again.');
+      }
       const signature = (await wallet.provider.request({
         method: 'personal_sign',
-        params: [toHex(challenge.data.message), address],
+        params: [toHex(message), address],
       })) as string;
 
       if (!signature) throw new Error('Your wallet didn\'t return a signature. Please try again and approve the request when it appears.');
 
-      const identity = await api.verify(challenge.data.message, signature);
+      const identity = await api.verify(message, signature);
+      if (!identity?.admin?.address) {
+        throw new Error('Sign-in succeeded but we could not load your operator profile. Please try connecting again.');
+      }
       setAdmin(identity.admin);
       setNotice('');
       await loadOverview();
@@ -515,22 +568,19 @@ export default function App() {
   /* ------------------------------------------------------------------ */
 
   const metric =
-    overview?.transactions.totals.periods.find(p => p.period === range) ||
-    overview?.transactions.totals.periods.find(p => p.period === 'allTime');
+    overview?.transactions?.totals?.periods?.find(p => p.period === range) ||
+    overview?.transactions?.totals?.periods?.find(p => p.period === 'allTime');
 
-  // Fix bar chart scale: use max of individual categories, not total
-  const categories = (overview?.transactions.byCategory || []).filter(x => x.key !== 'ALL');
-  const barMax = useMemo(() => {
-    return Math.max(
-      1,
-      ...categories.map(group => {
-        const p =
-          group.periods.find(x => x.period === range) ||
-          group.periods.find(x => x.period === 'allTime');
-        return p?.value.usd.current || 0;
-      })
-    );
-  }, [categories, range]);
+  const categories = (overview?.transactions?.byCategory || []).filter(x => x.key !== 'ALL');
+  const barMax = Math.max(
+    1,
+    ...categories.map(group => {
+      const p =
+        group.periods?.find(x => x.period === range) ||
+        group.periods?.find(x => x.period === 'allTime');
+      return p?.value?.usd?.current || 0;
+    }),
+  );
 
   const flashSoon = (label: string) => {
     setNoticeWithTimer(`${label} is coming soon! For now, you can find everything in the Overview section.`);
@@ -561,10 +611,10 @@ export default function App() {
         </nav>
         <div className="side-bottom">
           <div className="operator">
-            <div className="avatar">{admin.address.slice(2, 4).toUpperCase()}</div>
+            <div className="avatar">{(admin.address || '??').slice(2, 4).toUpperCase()}</div>
             <div>
               <strong>{admin.label || 'Administrator'}</strong>
-              <span>{admin.role.replace('_', ' ')}</span>
+              <span>{(admin.role || 'operator').replaceAll('_', ' ')}</span>
             </div>
           </div>
           <button
@@ -624,7 +674,7 @@ export default function App() {
             ))}
           </div>
           <span className="updated">
-            {overview
+            {overview?.meta?.generatedAt
               ? `Updated ${new Date(overview.meta.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
               : isLoadingOverview ? 'Loading…' : '—'}
           </span>
@@ -640,10 +690,10 @@ export default function App() {
             </>
           ) : (
             <>
-              <Kpi label="Transaction value" value={metric ? money(metric.value.usd.current) : '—'} change={metric?.value.usd} icon={<BarChart3 />} />
-              <Kpi label="Transaction volume" value={metric ? number(metric.volume.current) : '—'} change={metric?.volume} icon={<Activity />} />
+              <Kpi label="Transaction value" value={metric ? money(metric.value?.usd?.current) : '—'} change={metric?.value?.usd} icon={<BarChart3 />} />
+              <Kpi label="Transaction volume" value={metric ? number(metric.volume?.current) : '—'} change={metric?.volume} icon={<Activity />} />
               <Kpi label="Active users" value={userMetric(overview, 'activeUsers', range)} change={userGrowth(overview, 'activeUsers', range)} icon={<Users />} />
-              <Kpi label="USD / NGN rate" value={overview?.meta.fx.usdToNgn ? `₦${number(overview.meta.fx.usdToNgn)}` : '—'} icon={<ArrowUpRight />} />
+              <Kpi label="USD / NGN rate" value={overview?.meta?.fx?.usdToNgn ? `₦${number(overview.meta.fx.usdToNgn)}` : '—'} icon={<ArrowUpRight />} />
             </>
           )}
         </section>
@@ -656,7 +706,7 @@ export default function App() {
                 <h2>Transactions by category</h2>
               </div>
               <span className="select-label">
-                {overview?.meta.timezone || '—'}
+                {overview?.meta?.timezone || '—'}
                 <ChevronDown size={14} />
               </span>
             </div>
@@ -674,15 +724,15 @@ export default function App() {
               <div className="bars">
                 {categories.map(group => {
                   const p =
-                    group.periods.find(x => x.period === range) ||
-                    group.periods.find(x => x.period === 'allTime');
+                    group.periods?.find(x => x.period === range) ||
+                    group.periods?.find(x => x.period === 'allTime');
                   return (
                     <div className="bar-row" key={group.key}>
                       <span>{group.label}</span>
                       <div className="bar-track">
-                        <i style={{ width: `${Math.min(100, ((p?.value.usd.current || 0) / barMax) * 100)}%` }} />
+                        <i style={{ width: `${Math.min(100, ((p?.value?.usd?.current || 0) / barMax) * 100)}%` }} />
                       </div>
-                      <strong>{money(p?.value.usd.current || 0)}</strong>
+                      <strong>{money(p?.value?.usd?.current || 0)}</strong>
                     </div>
                   );
                 })}
@@ -705,7 +755,7 @@ export default function App() {
                 <p className="eyebrow">NETWORK HEALTH</p>
                 <h2>Provider activity</h2>
               </div>
-              <span className="count">{overview?.providers.length || 0} providers</span>
+              <span className="count">{overview?.providers?.length || 0} providers</span>
             </div>
             {isLoadingOverview ? (
               <div className="provider-list">
@@ -721,16 +771,16 @@ export default function App() {
               <div className="provider-list">
                 {(overview?.providers || []).slice(0, 5).map(provider => {
                   const p =
-                    provider.periods.find(x => x.period === range) ||
-                    provider.periods.find(x => x.period === 'allTime');
+                    provider.periods?.find(x => x.period === range) ||
+                    provider.periods?.find(x => x.period === 'allTime');
                   return (
                     <div className="provider-row" key={provider.code}>
-                      <div className="provider-icon">{provider.name.slice(0, 1)}</div>
+                      <div className="provider-icon">{(provider.name || '?').slice(0, 1)}</div>
                       <div className="provider-name">
                         <strong>{provider.name}</strong>
-                        <span>{provider.providerKind.replace('_', ' ')}</span>
+                        <span>{(provider.providerKind || 'provider').replaceAll('_', ' ')}</span>
                       </div>
-                      <strong>{money(p?.value.usd.current || 0)}</strong>
+                      <strong>{money(p?.value?.usd?.current || 0)}</strong>
                     </div>
                   );
                 })}
@@ -783,10 +833,10 @@ export default function App() {
                   <div key={i} className="match-card">
                     <div className="match-card-head">
                       <span className="match-index">#{i + 1}</span>
-                      {match.id && <span className="match-id">{String(match.id)}</span>}
+                      {match?.id != null && <span className="match-id">{String(match.id)}</span>}
                     </div>
                     <div className="match-fields">
-                      {Object.entries(match).map(([key, val]) => (
+                      {Object.entries(match || {}).map(([key, val]) => (
                         <div className="match-field" key={key}>
                           <dt>{key}</dt>
                           <dd>{typeof val === 'object' ? JSON.stringify(val) : String(val)}</dd>
@@ -821,10 +871,10 @@ function Kpi({ label, value, change, icon }: { label: string; value: string; cha
       </div>
       <strong>{value}</strong>
       {change && (
-        <div className={`change ${change.direction}`}>
-          {change.percentageChange === null
+        <div className={`change ${change.direction || 'flat'}`}>
+          {change.percentageChange == null
             ? change.isNew ? 'New activity' : 'No comparison'
-            : `${change.percentageChange >= 0 ? '+' : ''}${change.percentageChange.toFixed(1)}%`}
+            : `${change.percentageChange >= 0 ? '+' : ''}${Number(change.percentageChange).toFixed(1)}%`}
           <span> vs previous</span>
         </div>
       )}
@@ -832,24 +882,24 @@ function Kpi({ label, value, change, icon }: { label: string; value: string; cha
   );
 }
 
-function money(value: number) {
+function money(value?: number) {
   return `$${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value || 0)}`;
 }
 
-function number(value: number) {
+function number(value?: number) {
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value || 0);
 }
 
 function userMetric(o: api.Overview | null, key: string, period: string) {
   const g =
-    o?.users.find(x => x.key === key)?.periods.find(x => x.period === period) ||
-    o?.users.find(x => x.key === key)?.periods.find(x => x.period === 'allTime');
-  return g ? number(g.count.current) : '—';
+    o?.users?.find(x => x.key === key)?.periods?.find(x => x.period === period) ||
+    o?.users?.find(x => x.key === key)?.periods?.find(x => x.period === 'allTime');
+  return g ? number(g.count?.current) : '—';
 }
 
 function userGrowth(o: api.Overview | null, key: string, period: string) {
   const g =
-    o?.users.find(x => x.key === key)?.periods.find(x => x.period === period) ||
-    o?.users.find(x => x.key === key)?.periods.find(x => x.period === 'allTime');
+    o?.users?.find(x => x.key === key)?.periods?.find(x => x.period === period) ||
+    o?.users?.find(x => x.key === key)?.periods?.find(x => x.period === 'allTime');
   return g?.count;
 }
