@@ -12,16 +12,85 @@ export type SearchResult = { query: string; matches: Array<Record<string, unknow
 
 export const session = { get access() { return localStorage.getItem(accessKey); }, get refresh() { return localStorage.getItem(refreshKey); }, set(data: { accessToken: string; refreshToken: string }) { localStorage.setItem(accessKey, data.accessToken); localStorage.setItem(refreshKey, data.refreshToken); }, clear() { localStorage.removeItem(accessKey); localStorage.removeItem(refreshKey); } };
 
+/**
+ * Converts technical error messages from the server into
+ * plain, friendly text the operator can act on.
+ */
+function friendlyApiError(status: number, serverMessage: string | undefined): string {
+  const msg = (serverMessage || '').toLowerCase();
+
+  switch (status) {
+    case 400:
+      if (/nonce|challenge|signature|sign/i.test(msg))
+        return 'Something went wrong verifying your wallet. Please try connecting again.';
+      return 'We couldn\'t process your request. Please check what you entered and try again.';
+
+    case 401:
+      if (/expired|token|session/i.test(msg))
+        return 'Your session has expired. Please sign in again to continue.';
+      if (/allowlist|not authorized|not allowed|forbidden/i.test(msg))
+        return 'This wallet isn\'t on the approved admin list yet. Please contact your team lead to get access.';
+      return 'We couldn\'t verify your identity. Please sign in again.';
+
+    case 403:
+      return 'You don\'t have permission to do that. If you think this is a mistake, please contact your team lead.';
+
+    case 404:
+      return 'We couldn\'t find what you were looking for. It may have been removed or the address may be incorrect.';
+
+    case 408:
+      return 'The request took too long to complete. Please check your internet connection and try again.';
+
+    case 409:
+      return 'There\'s a conflict with the current data. Please refresh the page and try again.';
+
+    case 422:
+      return 'The information provided isn\'t quite right. Please double-check and try again.';
+
+    case 429:
+      return 'You\'re making requests a bit too quickly. Please wait a moment and try again.';
+
+    case 500:
+    case 502:
+    case 503:
+    case 504:
+      return 'Our servers are having trouble right now. Please wait a minute and try again. If the problem persists, let the team know.';
+
+    default:
+      if (serverMessage && serverMessage.length < 120 && !/\{|\[|stack|trace/i.test(serverMessage)) {
+        return serverMessage;
+      }
+      return `Something went wrong (error ${status}). Please try again in a moment.`;
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set('Content-Type', 'application/json');
   if (session.access) headers.set('Authorization', `Bearer ${session.access}`);
-  const response = await fetch(`${apiBase}${path}`, { ...init, headers });
-  if (response.status === 401 && retry && session.refresh) {
-    try { const refreshed = await request<{ data: { accessToken: string; refreshToken: string } }>('/admin/auth/refresh', { method: 'POST', body: JSON.stringify({ refreshToken: session.refresh }) }, false); session.set(refreshed.data); return request<T>(path, init, false); } catch { session.clear(); }
+
+  let response: Response;
+  try {
+    response = await fetch(`${apiBase}${path}`, { ...init, headers });
+  } catch {
+    throw new Error("We can't reach the Rown server right now. Please check your internet connection and try again.");
   }
+
+  if (response.status === 401 && retry && session.refresh) {
+    try {
+      const refreshed = await request<{ data: { accessToken: string; refreshToken: string } }>('/admin/auth/refresh', { method: 'POST', body: JSON.stringify({ refreshToken: session.refresh }) }, false);
+      session.set(refreshed.data);
+      return request<T>(path, init, false);
+    } catch {
+      session.clear();
+      throw new Error('Your session has expired. Please sign in again to continue.');
+    }
+  }
+
   const body = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(body?.message || `Request failed (${response.status})`);
+  if (!response.ok) {
+    throw new Error(friendlyApiError(response.status, body?.message));
+  }
   return body as T;
 }
 

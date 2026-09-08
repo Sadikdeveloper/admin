@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
   Activity,
@@ -7,7 +7,9 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleAlert,
+  Copy,
   ExternalLink,
+  Info,
   KeyRound,
   LogOut,
   PlugZap,
@@ -17,6 +19,7 @@ import {
   ShieldCheck,
   Users,
   Wallet,
+  X,
 } from 'lucide-react';
 import * as api from './api';
 
@@ -54,22 +57,51 @@ function describeConnectError(e: unknown): string {
   const code = (e as { code?: number })?.code;
   const msg = e instanceof Error ? e.message : String(e);
 
+  // User cancelled the connection in their wallet
   if (code === 4001 || /user rejected|user denied|rejected by user/i.test(msg)) {
-    return 'Connection was rejected in your wallet. Click Connect again and approve the request to sign in.';
+    return 'Connection was cancelled in your wallet. Click Connect on the wallet you want to use, then approve the request to sign in.';
   }
+  // Another wallet popup is already open
   if (code === -32002 || /already processing|request already pending|pending request/i.test(msg)) {
-    return 'Your wallet already has a pending request. Open the wallet popup, approve or reject it, then click Connect again.';
+    return 'Your wallet already has a request waiting. Open your wallet, approve or reject the pending request, then try connecting again.';
   }
+  // Wallet internal error
   if (code === -32603 || code === -32601) {
-    return `Your wallet could not handle the sign-in request (${code}). Try the "Scan again" button or restart your wallet extension.`;
+    return 'Your wallet had trouble processing the sign-in request. Try clicking "Scan again" or restart your wallet extension and try once more.';
   }
-  if (/failed to fetch|networkerror|network request failed|load failed/i.test(msg)) {
-    return `Can't reach the Rown API at ${api.apiBase}. Make sure the backend server is running and allows this origin (CORS), then try again.`;
+  // Network / CORS — keep it friendly, no URLs or technical terms
+  if (/failed to fetch|networkerror|network request failed|load failed|can't reach|reach the rown/i.test(msg)) {
+    return "We're having trouble reaching the Rown server. Please check your internet connection and try again in a moment.";
   }
-  if (/could not verify|not allowlisted|allowlist|not authorized|forbidden|401|403|unauthorized/i.test(msg)) {
-    return `This wallet is not on the admin allowlist yet. Add it from the backend (e.g. yarn seed:admin), then sign in again.`;
+  // Not allowlisted / unauthorized
+  if (/could not verify|not allowlisted|allowlist|not authorized|forbidden|401|403|unauthorized|approved admin/i.test(msg)) {
+    return "This wallet isn't on the approved admin list yet. Please ask your team lead to add it, then try signing in again.";
   }
-  return msg || 'Wallet sign-in failed. Please try again.';
+  // Empty or unknown signature response
+  if (/empty signature/i.test(msg)) {
+    return 'Your wallet didn\'t return a signature. Please try again and make sure to approve the request when prompted.';
+  }
+  // Already-user-friendly messages from api.ts (short, no technical jargon)
+  if (e instanceof Error && msg.length < 160 && !/\{|\[|stack|trace/i.test(msg)) {
+    return msg;
+  }
+  return 'Something went wrong while connecting your wallet. Please try again — if it keeps happening, let the team know.';
+}
+
+function copyToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  // Fallback for older browsers
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+  return Promise.resolve();
 }
 
 /* ------------------------------------------------------------------ */
@@ -86,18 +118,25 @@ export default function App() {
   const [range, setRange] = useState('all');
   const [query, setQuery] = useState('');
   const [result, setResult] = useState<api.SearchResult | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const [wallets, setWallets] = useState<BrowserWallet[]>([]);
   const [busyWalletId, setBusyWalletId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setNoticeWithTimer = useCallback((msg: string) => {
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    setNotice(msg);
+    noticeTimer.current = setTimeout(() => setNotice(''), 3200);
+  }, []);
 
   const addWallet = useCallback((wallet: BrowserWallet) => {
     setWallets(current => {
       const key = wallet.rdns ?? wallet.id;
       const idx = current.findIndex(w => (w.rdns ?? w.id) === key);
       if (idx === -1) return [...current, wallet];
-      // Prefer the richer EIP-6963 announcement (has a real icon) when a legacy
-      // injected fallback found the same wallet first.
       if (wallet.icon && !current[idx].icon) {
         const next = [...current];
         next[idx] = wallet;
@@ -113,9 +152,6 @@ export default function App() {
     window.dispatchEvent(new Event('eip6963:requestProvider'));
   }, []);
 
-  // Legacy fallback: read window.ethereum / window.ethereum.providers.
-  // Must run *after* MetaMask has injected itself, so it is re-run on an
-  // interval and whenever MetaMask fires `ethereum#initialized`.
   const scanInjected = useCallback(() => {
     const eth = (window as unknown as { ethereum?: any }).ethereum;
     if (!eth || typeof eth.request !== 'function') return;
@@ -159,9 +195,6 @@ export default function App() {
     };
 
     window.addEventListener('eip6963:announceProvider', handleAnnounce);
-    // MetaMask (legacy) fires this right after it sets window.ethereum — the
-    // classic cause of "wallet not detected" when the page loads faster than
-    // the extension does.
     window.addEventListener('ethereum#initialized', scanInjected as EventListener);
     requestProviders();
     scanInjected();
@@ -172,8 +205,6 @@ export default function App() {
     };
   }, [requestProviders, scanInjected, addWallet]);
 
-  // While signed out, keep asking for announcements so a wallet that injects
-  // late (cold start, slow machine, wallet just unlocked) still shows up.
   useEffect(() => {
     if (admin) return;
     const poll = window.setInterval(() => {
@@ -219,7 +250,7 @@ export default function App() {
         if (!alive) return;
         setRestoring(false);
         api.session.clear();
-        setError('Your saved session could not reach the Rown API. If the backend is running, sign in again below.');
+        setError("Your previous session couldn't be restored. Please sign in again with your wallet below.");
       });
     return () => {
       alive = false;
@@ -235,7 +266,7 @@ export default function App() {
     try {
       setOverview(await api.getOverview());
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not load analytics — is the backend running?');
+      setError(e instanceof Error ? e.message : "We couldn't load the latest analytics. Please try again in a moment.");
     } finally {
       setLoading(false);
     }
@@ -249,11 +280,17 @@ export default function App() {
     try {
       setResult(await api.searchTransactions(query.trim()));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Search failed — is the backend running?');
+      setError(e instanceof Error ? e.message : "We couldn't complete your search. Please try again in a moment.");
       setResult(null);
     } finally {
       setLoading(false);
     }
+  }
+
+  function clearSearch() {
+    setQuery('');
+    setResult(null);
+    setError('');
   }
 
   /* ---- Wallet connect / sign-in ---- */
@@ -264,7 +301,7 @@ export default function App() {
     try {
       const accounts = (await wallet.provider.request({ method: 'eth_requestAccounts' })) as string[];
       if (!accounts?.length) {
-        setError(`No accounts found in ${wallet.name}. Unlock your wallet and make sure an account is selected.`);
+        setError(`No accounts were found in ${wallet.name}. Please unlock your wallet and make sure an account is selected, then try connecting again.`);
         return;
       }
 
@@ -275,7 +312,7 @@ export default function App() {
         params: [toHex(challenge.data.message), address],
       })) as string;
 
-      if (!signature) throw new Error('The wallet returned an empty signature.');
+      if (!signature) throw new Error('Your wallet didn\'t return a signature. Please try again and approve the request when it appears.');
 
       const identity = await api.verify(challenge.data.message, signature);
       setAdmin(identity.admin);
@@ -301,6 +338,13 @@ export default function App() {
       setQuery('');
       setRange('all');
     }
+  }
+
+  async function handleCopyAddress(address: string) {
+    await copyToClipboard(address);
+    setCopied(true);
+    setNoticeWithTimer('Address copied to clipboard');
+    setTimeout(() => setCopied(false), 2000);
   }
 
   /* ------------------------------------------------------------------ */
@@ -340,12 +384,18 @@ export default function App() {
               <div className="banner banner-error" role="alert">
                 <CircleAlert size={16} className="banner-ico" />
                 <span>{error}</span>
+                <button className="banner-close" onClick={() => setError('')} aria-label="Dismiss error">
+                  <X size={14} />
+                </button>
               </div>
             )}
             {notice && (
               <div className="banner banner-info" role="status">
-                <CheckCircle2 size={16} className="banner-ico" />
+                <Info size={16} className="banner-ico" />
                 <span>{notice}</span>
+                <button className="banner-close" onClick={() => setNotice('')} aria-label="Dismiss notice">
+                  <X size={14} />
+                </button>
               </div>
             )}
 
@@ -468,10 +518,25 @@ export default function App() {
     overview?.transactions.totals.periods.find(p => p.period === range) ||
     overview?.transactions.totals.periods.find(p => p.period === 'allTime');
 
+  // Fix bar chart scale: use max of individual categories, not total
+  const categories = (overview?.transactions.byCategory || []).filter(x => x.key !== 'ALL');
+  const barMax = useMemo(() => {
+    return Math.max(
+      1,
+      ...categories.map(group => {
+        const p =
+          group.periods.find(x => x.period === range) ||
+          group.periods.find(x => x.period === 'allTime');
+        return p?.value.usd.current || 0;
+      })
+    );
+  }, [categories, range]);
+
   const flashSoon = (label: string) => {
-    setNotice(`${label} isn't included in this version of the console yet — Overview only.`);
-    window.setTimeout(() => setNotice(''), 3200);
+    setNoticeWithTimer(`${label} is coming soon! For now, you can find everything in the Overview section.`);
   };
+
+  const isLoadingOverview = loading && !overview;
 
   return (
     <div className="app-shell">
@@ -485,8 +550,14 @@ export default function App() {
         </div>
         <nav className="side-nav" aria-label="Console sections">
           <a className="active" aria-current="page"><BarChart3 size={17} />Overview</a>
-          <a onClick={() => flashSoon('Transactions')}><Activity size={17} />Transactions</a>
-          <a onClick={() => flashSoon('Users')}><Users size={17} />Users</a>
+          <a className="coming-soon" onClick={() => flashSoon('Transactions')}>
+            <Activity size={17} />Transactions
+            <span className="soon-badge">Soon</span>
+          </a>
+          <a className="coming-soon" onClick={() => flashSoon('Users')}>
+            <Users size={17} />Users
+            <span className="soon-badge">Soon</span>
+          </a>
         </nav>
         <div className="side-bottom">
           <div className="operator">
@@ -496,7 +567,14 @@ export default function App() {
               <span>{admin.role.replace('_', ' ')}</span>
             </div>
           </div>
-          <div className="operator-address" title={admin.address}>{shortAddress(admin.address)}</div>
+          <button
+            className="operator-address copyable"
+            title={`Click to copy: ${admin.address}`}
+            onClick={() => handleCopyAddress(admin.address)}
+          >
+            {shortAddress(admin.address)}
+            <Copy size={11} className="copy-icon" />
+          </button>
           <button className="signout-btn" onClick={signOut}><LogOut size={15} />Sign out</button>
         </div>
       </aside>
@@ -512,20 +590,28 @@ export default function App() {
             <button className="icon-button" title="Refresh analytics" onClick={loadOverview}>
               <RefreshCw size={16} className={loading ? 'spin' : ''} />
             </button>
-            <span className="status"><i />Live data</span>
+            <span className={`status ${!overview && !loading ? 'status-stale' : ''}`}>
+              <i />{overview ? 'Live data' : loading ? 'Connecting…' : 'No data'}
+            </span>
           </div>
         </header>
 
         {notice && (
           <div className="banner banner-info page-banner" role="status">
-            <CheckCircle2 size={16} className="banner-ico" />
+            <Info size={16} className="banner-ico" />
             <span>{notice}</span>
+            <button className="banner-close" onClick={() => setNotice('')} aria-label="Dismiss">
+              <X size={14} />
+            </button>
           </div>
         )}
         {error && (
           <div className="banner banner-error page-banner" role="alert">
             <CircleAlert size={16} className="banner-ico" />
             <span>{error}</span>
+            <button className="banner-close" onClick={() => setError('')} aria-label="Dismiss error">
+              <X size={14} />
+            </button>
           </div>
         )}
 
@@ -538,15 +624,28 @@ export default function App() {
             ))}
           </div>
           <span className="updated">
-            Updated {overview ? new Date(overview.meta.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '…'}
+            {overview
+              ? `Updated ${new Date(overview.meta.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+              : isLoadingOverview ? 'Loading…' : '—'}
           </span>
         </section>
 
         <section className="kpi-grid">
-          <Kpi label="Transaction value" value={metric ? money(metric.value.usd.current) : '—'} change={metric?.value.usd} icon={<BarChart3 />} />
-          <Kpi label="Transaction volume" value={metric ? number(metric.volume.current) : '—'} change={metric?.volume} icon={<Activity />} />
-          <Kpi label="Active users" value={userMetric(overview, 'activeUsers', range)} change={userGrowth(overview, 'activeUsers', range)} icon={<Users />} />
-          <Kpi label="USD / NGN rate" value={overview?.meta.fx.usdToNgn ? `₦${number(overview.meta.fx.usdToNgn)}` : '—'} icon={<ArrowUpRight />} />
+          {isLoadingOverview ? (
+            <>
+              <div className="kpi skeleton"><div className="skel-line skel-sm" /><div className="skel-line skel-lg" /><div className="skel-line skel-xs" /></div>
+              <div className="kpi skeleton"><div className="skel-line skel-sm" /><div className="skel-line skel-lg" /><div className="skel-line skel-xs" /></div>
+              <div className="kpi skeleton"><div className="skel-line skel-sm" /><div className="skel-line skel-lg" /><div className="skel-line skel-xs" /></div>
+              <div className="kpi skeleton"><div className="skel-line skel-sm" /><div className="skel-line skel-lg" /><div className="skel-line skel-xs" /></div>
+            </>
+          ) : (
+            <>
+              <Kpi label="Transaction value" value={metric ? money(metric.value.usd.current) : '—'} change={metric?.value.usd} icon={<BarChart3 />} />
+              <Kpi label="Transaction volume" value={metric ? number(metric.volume.current) : '—'} change={metric?.volume} icon={<Activity />} />
+              <Kpi label="Active users" value={userMetric(overview, 'activeUsers', range)} change={userGrowth(overview, 'activeUsers', range)} icon={<Users />} />
+              <Kpi label="USD / NGN rate" value={overview?.meta.fx.usdToNgn ? `₦${number(overview.meta.fx.usdToNgn)}` : '—'} icon={<ArrowUpRight />} />
+            </>
+          )}
         </section>
 
         <div className="dashboard-grid">
@@ -557,29 +656,43 @@ export default function App() {
                 <h2>Transactions by category</h2>
               </div>
               <span className="select-label">
-                {overview?.meta.timezone}
+                {overview?.meta.timezone || '—'}
                 <ChevronDown size={14} />
               </span>
             </div>
-            <div className="bars">
-              {(overview?.transactions.byCategory || [])
-                .filter(x => x.key !== 'ALL')
-                .map(group => {
+            {isLoadingOverview ? (
+              <div className="bars">
+                {[1, 2, 3, 4].map(i => (
+                  <div className="bar-row skeleton" key={i}>
+                    <span className="skel-line" style={{ width: '60%' }} />
+                    <div className="bar-track"><i style={{ width: `${20 + i * 15}%` }} className="skel-bar" /></div>
+                    <strong className="skel-line" style={{ width: '50%' }} />
+                  </div>
+                ))}
+              </div>
+            ) : categories.length > 0 ? (
+              <div className="bars">
+                {categories.map(group => {
                   const p =
                     group.periods.find(x => x.period === range) ||
                     group.periods.find(x => x.period === 'allTime');
-                  const max = metric?.value.usd.current || 1;
                   return (
                     <div className="bar-row" key={group.key}>
                       <span>{group.label}</span>
                       <div className="bar-track">
-                        <i style={{ width: `${Math.min(100, ((p?.value.usd.current || 0) / max) * 100)}%` }} />
+                        <i style={{ width: `${Math.min(100, ((p?.value.usd.current || 0) / barMax) * 100)}%` }} />
                       </div>
                       <strong>{money(p?.value.usd.current || 0)}</strong>
                     </div>
                   );
                 })}
-            </div>
+              </div>
+            ) : (
+              <div className="panel-empty">
+                <BarChart3 size={24} />
+                <p>No transaction categories to display yet.</p>
+              </div>
+            )}
             <div className="chart-foot">
               <span>Value in USD</span>
               <span><i className="legend-dot" />Settled only</span>
@@ -594,23 +707,40 @@ export default function App() {
               </div>
               <span className="count">{overview?.providers.length || 0} providers</span>
             </div>
-            <div className="provider-list">
-              {(overview?.providers || []).slice(0, 5).map(provider => {
-                const p =
-                  provider.periods.find(x => x.period === range) ||
-                  provider.periods.find(x => x.period === 'allTime');
-                return (
-                  <div className="provider-row" key={provider.code}>
-                    <div className="provider-icon">{provider.name.slice(0, 1)}</div>
-                    <div className="provider-name">
-                      <strong>{provider.name}</strong>
-                      <span>{provider.providerKind.replace('_', ' ')}</span>
-                    </div>
-                    <strong>{money(p?.value.usd.current || 0)}</strong>
+            {isLoadingOverview ? (
+              <div className="provider-list">
+                {[1, 2, 3].map(i => (
+                  <div className="provider-row skeleton" key={i}>
+                    <div className="provider-icon skel-circle" />
+                    <div className="provider-name"><div className="skel-line" style={{ width: '70%' }} /><div className="skel-line skel-xs" style={{ width: '40%', marginTop: 4 }} /></div>
+                    <strong className="skel-line" style={{ width: '50px' }} />
                   </div>
-                );
-              })}
-            </div>
+                ))}
+              </div>
+            ) : (overview?.providers || []).length > 0 ? (
+              <div className="provider-list">
+                {(overview?.providers || []).slice(0, 5).map(provider => {
+                  const p =
+                    provider.periods.find(x => x.period === range) ||
+                    provider.periods.find(x => x.period === 'allTime');
+                  return (
+                    <div className="provider-row" key={provider.code}>
+                      <div className="provider-icon">{provider.name.slice(0, 1)}</div>
+                      <div className="provider-name">
+                        <strong>{provider.name}</strong>
+                        <span>{provider.providerKind.replace('_', ' ')}</span>
+                      </div>
+                      <strong>{money(p?.value.usd.current || 0)}</strong>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="panel-empty">
+                <Users size={24} />
+                <p>No provider data available yet.</p>
+              </div>
+            )}
           </section>
         </div>
 
@@ -631,6 +761,11 @@ export default function App() {
                 placeholder="e.g. RWN-20260901-a1b2c3d4"
                 aria-label="Search transactions"
               />
+              {query && (
+                <button type="button" className="search-clear" onClick={clearSearch} aria-label="Clear search">
+                  <X size={14} />
+                </button>
+              )}
               <button type="submit" disabled={loading}>
                 {loading ? 'Searching…' : 'Search'}
               </button>
@@ -641,15 +776,30 @@ export default function App() {
               <div className="search-results">
                 <div className="search-results-head">
                   <strong>{result.matches.length} matching record{result.matches.length === 1 ? '' : 's'}</strong>
-                  <span>for “{result.query}”</span>
+                  <span>for "{result.query}"</span>
+                  <button type="button" className="search-results-clear" onClick={clearSearch}>Clear</button>
                 </div>
                 {result.matches.map((match, i) => (
-                  <pre key={i} className="match-card">{JSON.stringify(match, null, 2)}</pre>
+                  <div key={i} className="match-card">
+                    <div className="match-card-head">
+                      <span className="match-index">#{i + 1}</span>
+                      {match.id && <span className="match-id">{String(match.id)}</span>}
+                    </div>
+                    <div className="match-fields">
+                      {Object.entries(match).map(([key, val]) => (
+                        <div className="match-field" key={key}>
+                          <dt>{key}</dt>
+                          <dd>{typeof val === 'object' ? JSON.stringify(val) : String(val)}</dd>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 ))}
               </div>
             ) : (
               <div className="search-empty">
-                No transactions matched “{result.query}”. Check the reference or try a full transaction hash.
+                <Search size={20} />
+                <p>No transactions matched "{result.query}". Check the reference or try a full transaction hash.</p>
               </div>
             ))}
         </section>
