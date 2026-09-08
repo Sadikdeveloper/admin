@@ -1,4 +1,4 @@
-const BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
+export const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
 const accessKey = 'rown.admin.access';
 const refreshKey = 'rown.admin.refresh';
 
@@ -16,7 +16,7 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   const headers = new Headers(init.headers);
   headers.set('Content-Type', 'application/json');
   if (session.access) headers.set('Authorization', `Bearer ${session.access}`);
-  const response = await fetch(`${BASE}${path}`, { ...init, headers });
+  const response = await fetch(`${apiBase}${path}`, { ...init, headers });
   if (response.status === 401 && retry && session.refresh) {
     try { const refreshed = await request<{ data: { accessToken: string; refreshToken: string } }>('/admin/auth/refresh', { method: 'POST', body: JSON.stringify({ refreshToken: session.refresh }) }, false); session.set(refreshed.data); return request<T>(path, init, false); } catch { session.clear(); }
   }
