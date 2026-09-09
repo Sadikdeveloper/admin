@@ -1848,3 +1848,158 @@ p {
     display: none;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Transaction match card enhancements                                 */
+/* ------------------------------------------------------------------ */
+
+.match-source {
+  font: 600 9px var(--mono);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--green-strong);
+  background: var(--mint-soft);
+  padding: 2px 7px;
+  border-radius: 3px;
+}
+
+.match-status {
+  margin-left: auto;
+  font: 600 9px var(--mono);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 3px;
+}
+
+.match-status.status-succeeded,
+.match-status.status-completed {
+  color: #1a7a52;
+  background: #e6f7ef;
+}
+
+.match-status.status-pending,
+.match-status.status-processing {
+  color: #8a6b10;
+  background: #fdf4e5;
+}
+
+.match-status.status-failed,
+.match-status.status-cancelled {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.match-section {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eef1ef;
+  margin-bottom: 4px;
+}
+
+.match-section dt {
+  flex: none;
+  width: 140px;
+  color: var(--muted);
+  font: 500 11px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.match-section dd {
+  margin: 0;
+  font: 400 12px var(--mono);
+  color: var(--ink);
+}
+
+.match-sub {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------------ */
+/* User metrics table                                                  */
+/* ------------------------------------------------------------------ */
+
+.user-metrics-table {
+  margin-top: 8px;
+}
+
+.metrics-table-head,
+.metrics-table-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) repeat(4, 100px);
+  gap: 12px;
+  align-items: start;
+  padding: 10px 0;
+}
+
+.metrics-table-head {
+  border-bottom: 2px solid var(--line);
+  font: 600 10px var(--mono);
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.metrics-table-row {
+  border-bottom: 1px solid #eef1ef;
+}
+
+.metrics-table-row:last-child {
+  border-bottom: 0;
+}
+
+.metric-col-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.metric-col-label strong {
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metric-def {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.metric-col-value {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: right;
+}
+
+.metric-col-value strong {
+  font: 500 12px var(--mono);
+}
+
+@media (max-width: 720px) {
+  .metrics-table-head,
+  .metrics-table-row {
+    grid-template-columns: 1fr 70px;
+  }
+
+  .metric-col-value:nth-child(3),
+  .metric-col-value:nth-child(4),
+  .metric-col-value:nth-child(5) {
+    display: none;
+  }
+
+  .metrics-table-head span:nth-child(3),
+  .metrics-table-head span:nth-child(4),
+  .metrics-table-head span:nth-child(5) {
+    display: none;
+  }
+}

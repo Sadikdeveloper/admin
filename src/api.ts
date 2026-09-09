@@ -6,9 +6,18 @@ export type Admin = { address: string; label: string | null; role: string };
 export type Growth = { current: number; previous: number; absoluteChange: number; percentageChange: number | null; direction: 'up' | 'down' | 'flat'; isNew: boolean; isEmpty: boolean; comparable: boolean };
 export type PeriodMetric = { period: string; label: string; value: { usd: Growth; ngn: Growth | null; ngnSnapshotCoverage: number }; volume: Growth };
 export type Group = { key: string; label: string; periods: PeriodMetric[]; definition?: string };
-export type UserGroup = { key: string; label: string; periods: { period: string; count: Growth }[]; definition?: string };
-export type Overview = { meta: { generatedAt: string; timezone: string; fx: { usdToNgn: number | null; degraded: boolean; asOf: string | null; source: string | null }; notes?: string[] }; transactions: { totals: Group; byCategory: Group[] }; deposits: { totals: Group; byCategory: Group[] }; topups: { totals: Group; byCategory: Group[] }; providers: { name: string; code: string; providerKind: string; categories: string[]; periods: PeriodMetric[] }[]; users: UserGroup[] };
-export type SearchResult = { query: string; matches: Array<Record<string, unknown>> };
+export type UserGroup = { key: string; label: string; definition?: string; periods: { period: string; label: string; count: Growth }[] };
+export type Provider = { name: string; code: string; providerKind: string; categories: string[]; periods: PeriodMetric[] };
+export type UserStock = { asOf: string; totalUsers: number; walletUsers: number; kycEverVerified: number; kycVerifiedNow: number; usersWithActiveGuardian: number; usersWithoutActiveGuardian: number; activeGuardianRecords: number; walletUsersWithGuardianShare: number | null };
+export type AnalyticsMeta = { generatedAt: string; timezone: string; fx: { usdToNgn: number | null; degraded: boolean; asOf: string | null; source: string | null }; notes?: string[] };
+export type Overview = { meta: AnalyticsMeta; transactions: { totals: Group; byCategory: Group[] }; deposits: { totals: Group; byCategory: Group[] }; topups: { totals: Group; byCategory: Group[] }; providers: Provider[]; users: { groups: UserGroup[]; stock: UserStock } };
+export type TransactionAnalytics = { meta: AnalyticsMeta; totals: Group; byCategory: Group[]; byProvider: Provider[] };
+export type DepositAnalytics = { meta: AnalyticsMeta; totals: Group; byCategory: Group[]; byProvider: Provider[] };
+export type TopupAnalytics = { meta: AnalyticsMeta; totals: Group; byCategory: Group[]; byProvider: Provider[] };
+export type ProviderAnalytics = { meta: AnalyticsMeta; providers: Provider[] };
+export type UserAnalytics = { meta: AnalyticsMeta; groups: UserGroup[]; stock: UserStock };
+export type TransactionMatch = { source: string; matchedOn: string; reference: string; category: string; status: string; statusScope: string; createdAt: string | null; updatedAt: string | null; settledAt: string | null; customer: { id: string; phone: string; fullName: string | null; email: string | null; country: string | null; localCurrency: string; kycCompleted: boolean; hasCreatedWallet: boolean; createdAt: string | null } | null; amounts: Record<string, unknown>; provider: Record<string, unknown>; onchain: Record<string, unknown>; counterparty: Record<string, unknown> | null; lifecycle: Record<string, unknown>; related: Array<{ source: string; reference: string; id: string }>; providerPayload?: Record<string, unknown> | null };
+export type SearchResult = { query: string; isRownReference: boolean; matches: TransactionMatch[] };
 
 export const session = {
   get access() { return localStorage.getItem(accessKey); },
@@ -137,11 +146,46 @@ export async function logout() {
   try { await request('/admin/auth/logout', { method: 'POST' }); } finally { session.clear(); }
 }
 
-export async function getOverview(params: { from?: string; to?: string } = {}) {
-  const query = new URLSearchParams({ timezone: 'Africa/Lagos', ...params }).toString();
+export async function getOverview(params: AnalyticsParams = {}) {
+  const query = buildAnalyticsQuery(params);
   return unwrap<Overview>(await request<{ data: Overview } | Overview>(`/admin/analytics/overview?${query}`));
 }
 
 export async function searchTransactions(query: string) {
   return unwrap<SearchResult>(await request<{ data: SearchResult } | SearchResult>(`/admin/transactions/search?q=${encodeURIComponent(query)}`));
+}
+
+export async function getTransactionByReference(reference: string) {
+  return unwrap<SearchResult>(await request<{ data: SearchResult } | SearchResult>(`/admin/transactions/${encodeURIComponent(reference)}`));
+}
+
+export async function getTransactions(params: AnalyticsParams = {}) {
+  const query = buildAnalyticsQuery(params);
+  return unwrap<TransactionAnalytics>(await request<{ data: TransactionAnalytics } | TransactionAnalytics>(`/admin/analytics/transactions?${query}`));
+}
+
+export async function getDeposits(params: AnalyticsParams = {}) {
+  const query = buildAnalyticsQuery(params);
+  return unwrap<DepositAnalytics>(await request<{ data: DepositAnalytics } | DepositAnalytics>(`/admin/analytics/deposits?${query}`));
+}
+
+export async function getTopups(params: AnalyticsParams = {}) {
+  const query = buildAnalyticsQuery(params);
+  return unwrap<TopupAnalytics>(await request<{ data: TopupAnalytics } | TopupAnalytics>(`/admin/analytics/topups?${query}`));
+}
+
+export async function getProviders(params: AnalyticsParams = {}) {
+  const query = buildAnalyticsQuery(params);
+  return unwrap<ProviderAnalytics>(await request<{ data: ProviderAnalytics } | ProviderAnalytics>(`/admin/analytics/providers?${query}`));
+}
+
+export async function getUsers(params: AnalyticsParams = {}) {
+  const query = buildAnalyticsQuery(params);
+  return unwrap<UserAnalytics>(await request<{ data: UserAnalytics } | UserAnalytics>(`/admin/analytics/users?${query}`));
+}
+
+type AnalyticsParams = { from?: string; to?: string };
+
+function buildAnalyticsQuery(params: AnalyticsParams): string {
+  return new URLSearchParams({ timezone: 'Africa/Lagos', ...params }).toString();
 }
