@@ -1,10 +1,27 @@
-export const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000';
+/**
+ * An explicitly empty VITE_API_BASE_URL means "use relative URLs", which lets
+ * the dev server (or a reverse proxy) forward /admin to the real API. Only an
+ * unset variable falls back to the local default.
+ */
+const configuredBase = import.meta.env.VITE_API_BASE_URL;
+export const apiBase = configuredBase === undefined ? 'http://localhost:3000' : configuredBase;
 const accessKey = 'rown.admin.access';
 const refreshKey = 'rown.admin.refresh';
 
 export type Admin = { address: string; label: string | null; role: string };
 export type Growth = { current: number; previous: number; absoluteChange: number; percentageChange: number | null; direction: 'up' | 'down' | 'flat'; isNew: boolean; isEmpty: boolean; comparable: boolean };
-export type PeriodMetric = { period: string; label: string; value: { usd: Growth; ngn: Growth | null; ngnSnapshotCoverage: number }; volume: Growth };
+/**
+ * A money bucket as returned by the analytics service. `net` and `fees` are
+ * only present on transaction-shaped payloads, so they stay optional.
+ */
+export type MoneyValue = {
+  usd: Growth;
+  ngn: Growth | null;
+  ngnSnapshotCoverage: number;
+  net?: { usd: Growth; ngn: Growth | null } | null;
+  fees?: { usd: Growth; ngn: Growth | null } | null;
+};
+export type PeriodMetric = { period: string; label: string; value: MoneyValue; volume: Growth };
 export type Group = { key: string; label: string; periods: PeriodMetric[]; definition?: string };
 export type UserGroup = { key: string; label: string; definition?: string; periods: { period: string; label: string; count: Growth }[] };
 export type Provider = { name: string; code: string; providerKind: string; categories: string[]; periods: PeriodMetric[] };
@@ -184,8 +201,13 @@ export async function getUsers(params: AnalyticsParams = {}) {
   return unwrap<UserAnalytics>(await request<{ data: UserAnalytics } | UserAnalytics>(`/admin/analytics/users?${query}`));
 }
 
-type AnalyticsParams = { from?: string; to?: string };
+export type AnalyticsParams = { from?: string; to?: string };
 
 function buildAnalyticsQuery(params: AnalyticsParams): string {
-  return new URLSearchParams({ timezone: 'Africa/Lagos', ...params }).toString();
+  const query = new URLSearchParams({ timezone: 'Africa/Lagos' });
+  // Spreading the params directly would serialise `undefined` as the literal
+  // string "undefined" and make the server reject the window.
+  if (params.from) query.set('from', params.from);
+  if (params.to) query.set('to', params.to);
+  return query.toString();
 }
