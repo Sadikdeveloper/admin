@@ -82,7 +82,7 @@ export function RangeTabs({
 /** Surfaces the FX rate and any degradation the API reports, instead of hiding it. */
 export function MetaStrip({ meta }: { meta?: api.AnalyticsMeta | null }) {
   if (!meta) return null;
-  const { fx, timezone, notes } = meta;
+  const { fx, timezone } = meta;
   return (
     <section className="meta-strip">
       <span className="meta-chip">
@@ -111,12 +111,6 @@ export function MetaStrip({ meta }: { meta?: api.AnalyticsMeta | null }) {
           NGN figures use a stale rate
         </span>
       )}
-      {notes?.map(note => (
-        <span className="meta-chip" key={note}>
-          <Info size={13} />
-          {note}
-        </span>
-      ))}
     </section>
   );
 }
