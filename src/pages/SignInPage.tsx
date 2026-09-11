@@ -9,9 +9,22 @@ import {
   RefreshCw,
   ScanLine,
   ShieldCheck,
+  Smartphone,
   Wallet,
   X,
 } from 'lucide-react';
+
+function mobileWalletLinks() {
+  const pageUrl = window.location.href;
+  // MetaMask expects the dapp URL without its protocol, while Coinbase and
+  // Trust accept the complete encoded URL.
+  const dappPath = `${window.location.host}${window.location.pathname}${window.location.search}${window.location.hash}`;
+  return [
+    { name: 'MetaMask', href: `https://metamask.app.link/dapp/${dappPath}` },
+    { name: 'Coinbase Wallet', href: `https://go.cb-w.com/dapp?cb_url=${encodeURIComponent(pageUrl)}` },
+    { name: 'Trust Wallet', href: `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(pageUrl)}` },
+  ];
+}
 
 export function SignInPage({
   error,
@@ -22,6 +35,7 @@ export function SignInPage({
   wallets,
   busyWalletId,
   scanning,
+  isMobileDevice,
   rescanWallets,
   connectWithWallet,
 }: {
@@ -33,6 +47,7 @@ export function SignInPage({
   wallets: BrowserWallet[];
   busyWalletId: string | null;
   scanning: boolean;
+  isMobileDevice: boolean;
   rescanWallets: () => void;
   connectWithWallet: (w: BrowserWallet) => void;
 }) {
@@ -119,7 +134,7 @@ export function SignInPage({
                         </span>
                         <span className="wallet-meta">
                           <strong>{wallet.name}</strong>
-                          <span>Browser extension</span>
+                          <span>{isMobileDevice ? 'Mobile wallet' : 'Browser extension'}</span>
                         </span>
                         <button
                           type="button"
@@ -143,6 +158,31 @@ export function SignInPage({
                 <p className="wallet-foot">
                   <CheckCircle2 size={13} />
                   Auto-detection is active — installing or unlocking a wallet updates this list automatically.
+                </p>
+              </div>
+            ) : isMobileDevice ? (
+              <div className="wallet-empty mobile-wallet-empty">
+                <div className="empty-icon"><Smartphone size={22} /></div>
+                <h3>Open in your wallet</h3>
+                <p>
+                  Mobile browsers cannot see which wallet apps are installed. Open this secure sign-in page inside your
+                  wallet's browser, then connect and approve the signature.
+                </p>
+                <div className="mobile-wallet-links" aria-label="Open this page in a mobile wallet">
+                  {mobileWalletLinks().map(wallet => (
+                    <a className="mobile-wallet-link" href={wallet.href} key={wallet.name}>
+                      <span className="wallet-avatar"><Wallet size={16} /></span>
+                      <span>{wallet.name}</span>
+                      <ExternalLink size={15} />
+                    </a>
+                  ))}
+                </div>
+                <button type="button" className="rescan-link" onClick={rescanWallets} disabled={scanning}>
+                  <RefreshCw size={14} className={scanning ? 'spin' : ''} />
+                  {scanning ? 'Checking for a wallet…' : 'I am already in my wallet — check again'}
+                </button>
+                <p className="empty-tip">
+                  Already opened here from a wallet app? Unlock the wallet first, then check again.
                 </p>
               </div>
             ) : (

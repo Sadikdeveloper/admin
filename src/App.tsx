@@ -87,6 +87,11 @@ function pageFromHash(): Page {
   return PAGES.includes(hash) ? hash : 'overview';
 }
 
+function isMobileBrowser(): boolean {
+  const ua = navigator.userAgent;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1);
+}
+
 /* ------------------------------------------------------------------ */
 /* Error boundary                                                      */
 /* ------------------------------------------------------------------ */
@@ -510,6 +515,7 @@ export default function App() {
         wallets={wallets}
         busyWalletId={busyWalletId}
         scanning={scanning}
+        isMobileDevice={isMobileBrowser()}
         rescanWallets={rescanWallets}
         connectWithWallet={connectWithWallet}
       />
