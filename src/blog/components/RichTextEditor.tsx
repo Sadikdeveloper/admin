@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useImperativeHandle, useRef, useState } from 'react';
-import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, Ref } from 'react';
+import type { ChangeEvent, ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, Ref } from 'react';
 import {
+  ArrowDown,
+  ArrowUp,
   Bold,
   Braces,
   Code,
@@ -14,16 +16,23 @@ import {
   ListOrdered,
   Loader2,
   Minus,
+  Pencil,
   Quote,
   Redo2,
   RemoveFormatting,
   SquareCode,
   Strikethrough,
+  Trash2,
   Underline,
   Undo2,
+  Upload,
 } from 'lucide-react';
 import { Modal } from '../../components/Modal';
-import { countWords, readingMinutes, sanitizeBlogHtml, sanitizeUrl } from '../../lib/blog-html';
+import { countWords, htmlToPlainText, readingMinutes, sanitizeBlogHtml, sanitizeUrl } from '../../lib/blog-html';
+import { ACCEPTED_IMAGE_TYPES } from '../../lib/blog';
+import { describeUploadError } from '../../lib/blog-images';
+import { bookmarkEditorRange, editorEnd, editorSelection, insertEditorBlocks, insertEditorHtml, rangeIsInEditor, sameRange } from '../../lib/blog-editor';
+import { HtmlSnippetDialog } from './HtmlSnippetDialog';
 
 export type InsertedImage = { src: string; alt?: string; caption?: string };
 
@@ -58,12 +67,6 @@ const EMPTY_TOOLBAR: ToolbarState = {
 
 /** The API stores up to 1 MB of HTML, so warn before it turns into a 400. */
 const HTML_SOFT_LIMIT = 900_000;
-
-/** Blocks we split at the caret when inserting an image or divider. */
-const SPLIT_HOSTS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
-/** Blocks we insert after, because splitting them would break their structure. */
-const AFTER_HOSTS = new Set(['UL', 'OL', 'LI', 'BLOCKQUOTE', 'TABLE', 'THEAD', 'TBODY', 'TR', 'TD', 'TH', 'FIGURE', 'PRE', 'DL']);
-const TEXT_BLOCKS = ['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'UL', 'OL', 'BLOCKQUOTE', 'PRE', 'DIV'];
 
 function ToolButton({
   label,
@@ -108,6 +111,7 @@ export function RichTextEditor({
   onChange,
   onPickImage,
   onUploadFile,
+  onUploadingChange,
   disabled = false,
   invalid = false,
   error,
@@ -119,6 +123,7 @@ export function RichTextEditor({
   onChange: (html: string) => void;
   onPickImage?: () => void;
   onUploadFile?: (file: File) => Promise<InsertedImage | null>;
+  onUploadingChange?: (count: number) => void;
   disabled?: boolean;
   invalid?: boolean;
   error?: string | null;
@@ -126,6 +131,13 @@ export function RichTextEditor({
   label?: string;
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const draggedImage = useRef<Element | null>(null);
+  const sourceInputRef = useRef<HTMLTextAreaElement>(null);
+  const uploadQueue = useRef<Promise<void>>(Promise.resolve());
+  const uploadAnchor = useRef<{ owner: HTMLDivElement; version: number; range: Range } | null>(null);
+  const mounted = useRef(true);
+  const documentVersion = useRef(0);
   const savedRange = useRef<Range | null>(null);
   const lastHtml = useRef<string>(value ?? '');
   /* False until the mounted value has been written into the contenteditable. */
@@ -139,6 +151,12 @@ export function RichTextEditor({
   const [sourceDraft, setSourceDraft] = useState('');
   const [sourceNotice, setSourceNotice] = useState<string | null>(null);
   const [uploading, setUploading] = useState(0);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [htmlDialogOpen, setHtmlDialogOpen] = useState(false);
+  const [selectedImage, setSelectedImage] = useState<HTMLImageElement | null>(null);
+  const [imageDetails, setImageDetails] = useState<{ alt: string; caption: string } | null>(null);
+  const editable = useRef(true);
+  editable.current = !disabled && !sourceMode;
   const [dragging, setDragging] = useState(false);
   const [linkDialog, setLinkDialog] = useState<{ open: boolean; url: string; text: string; newTab: boolean; editing: boolean }>({
     open: false,
@@ -253,10 +271,9 @@ export function RichTextEditor({
 
   const saveSelection = useCallback(() => {
     const editor = editorRef.current;
-    const selection = window.getSelection();
-    if (!editor || !selection || selection.rangeCount === 0) return;
-    const range = selection.getRangeAt(0);
-    if (editor.contains(range.commonAncestorContainer)) savedRange.current = range.cloneRange();
+    if (!editor) return;
+    const range = editorSelection(editor);
+    if (range) savedRange.current = range;
   }, []);
 
   const restoreSelection = useCallback((): Range | null => {
@@ -324,7 +341,14 @@ export function RichTextEditor({
       ensureEditable();
       return;
     }
-    if (editor.innerHTML !== next) editor.innerHTML = next;
+    const clean = sanitizeBlogHtml(next);
+    if (editor.innerHTML !== clean) {
+      editor.innerHTML = clean;
+      documentVersion.current += 1;
+    }
+    savedRange.current = null;
+    setSelectedImage(null);
+    setImageDetails(null);
     lastHtml.current = next;
     hydrated.current = true;
     ensureEditable();
@@ -342,118 +366,56 @@ export function RichTextEditor({
       const selection = window.getSelection();
       if (!editor || !selection || selection.rangeCount === 0) return;
       if (!editor.contains(selection.getRangeAt(0).commonAncestorContainer)) return;
+      saveSelection();
       updateToolbar();
     };
     document.addEventListener('selectionchange', onSelectionChange);
     return () => document.removeEventListener('selectionchange', onSelectionChange);
-  }, [updateToolbar]);
+  }, [saveSelection, updateToolbar]);
 
   /* ---------------------------------------------------------------- */
   /* Block insertion (images, dividers)                                */
   /* ---------------------------------------------------------------- */
 
-  const closestBlock = (node: Node | null): Element | null => {
+  const placeCaret = useCallback((range: Range, focus = true) => {
     const editor = editorRef.current;
-    let current = closestElement(node);
-    while (current && current !== editor) {
-      if (SPLIT_HOSTS.has(current.tagName) || AFTER_HOSTS.has(current.tagName) || current.tagName === 'DIV') return current;
-      current = current.parentElement;
-    }
-    return null;
-  };
-
-  const outermostBlock = (node: Element): Element | null => {
-    const editor = editorRef.current;
-    if (!editor) return null;
-    let current: Element = node;
-    while (current.parentElement && current.parentElement !== editor) current = current.parentElement;
-    return current === editor ? null : current;
-  };
-
-  /** Makes sure there is always somewhere to type after an inserted block. */
-  const ensureTrailingParagraph = (): HTMLElement | null => {
-    const editor = editorRef.current;
-    if (!editor) return null;
-    const children = Array.from(editor.children);
-    const last = children.length ? children[children.length - 1] : null;
-    if (last && TEXT_BLOCKS.includes(last.tagName)) return null;
-    const paragraph = document.createElement('p');
-    paragraph.appendChild(document.createElement('br'));
-    editor.appendChild(paragraph);
-    return paragraph;
-  };
+    if (!editor || !rangeIsInEditor(editor, range)) return;
+    if (focus) editor.focus();
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    savedRange.current = range.cloneRange();
+  }, []);
 
   const insertBlockElements = useCallback(
-    (elements: Element[]) => {
+    (elements: Element[], atRange?: Range): Range | null => {
       const editor = editorRef.current;
-      if (!editor || !elements.length || disabled || sourceMode) return;
-
-      const range = restoreSelection();
-      const selection = window.getSelection();
-      if (!range || !selection) return;
-      range.deleteContents();
-
-      const host = closestBlock(range.startContainer);
-      const last = elements[elements.length - 1];
-
-      if (host && host !== editor && SPLIT_HOSTS.has(host.tagName)) {
-        // Split the paragraph at the caret so the block sits between the halves
-        // instead of being nested inside a <p>.
-        const tail = document.createRange();
-        tail.selectNodeContents(host);
-        try {
-          tail.setStart(range.endContainer, range.endOffset);
-        } catch {
-          tail.setStartAfter(host.lastChild ?? host);
-        }
-        const tailFragment = tail.extractContents();
-        const parent = host.parentNode ?? editor;
-        const reference = host.nextSibling;
-
-        elements.forEach(element => parent.insertBefore(element, reference));
-
-        const tailHasContent = (tailFragment.textContent ?? '').trim() || tailFragment.querySelector('img, hr, li');
-        if (tailHasContent) {
-          const clone = host.cloneNode(false) as Element;
-          clone.appendChild(tailFragment);
-          parent.insertBefore(clone, reference);
-        } else if (!(host.textContent ?? '').trim() && !host.querySelector('img, hr')) {
-          host.remove();
-        }
-      } else if (host && host !== editor && AFTER_HOSTS.has(host.tagName)) {
-        const outer = outermostBlock(host) ?? host;
-        const parent = outer.parentNode ?? editor;
-        const reference = outer.nextSibling;
-        elements.forEach(element => parent.insertBefore(element, reference));
-      } else {
-        const fragment = document.createDocumentFragment();
-        elements.forEach(element => fragment.appendChild(element));
-        range.insertNode(fragment);
-      }
-
-      const trailing = ensureTrailingParagraph();
-      const caret = document.createRange();
-      if (trailing) {
-        caret.selectNodeContents(trailing);
-        caret.collapse(true);
-      } else {
-        caret.setStartAfter(last);
-        caret.collapse(true);
-      }
-      selection.removeAllRanges();
-      selection.addRange(caret);
-      savedRange.current = caret.cloneRange();
-
+      if (!editor || !elements.length || !editable.current) return null;
+      // A detached range belongs to a previous/replaced article. Never insert
+      // a delayed upload into an unrelated place or a different post.
+      if (atRange && !rangeIsInEditor(editor, atRange)) return null;
+      const range = atRange?.cloneRange() ?? restoreSelection();
+      if (!range) return null;
+      const current = editorSelection(editor);
+      const active = document.activeElement;
+      const keepOutsideFocus = Boolean(atRange && active && active !== editor && active !== document.body && !editor.parentElement?.parentElement?.contains(active));
+      const keepCurrent = Boolean(atRange && current && !sameRange(current, atRange) && document.activeElement === editor);
+      const restoreCurrent = keepCurrent && current ? bookmarkEditorRange(editor, current) : null;
+      const caret = insertEditorBlocks(editor, range, elements);
+      const preserved = restoreCurrent?.();
+      if (preserved) placeCaret(preserved, false);
+      else if (caret && !keepOutsideFocus) placeCaret(caret);
       sync();
       updateToolbar();
+      return caret;
     },
-    [disabled, sourceMode, restoreSelection, sync, updateToolbar],
+    [placeCaret, restoreSelection, sync, updateToolbar],
   );
 
   const insertImage = useCallback(
-    (image: InsertedImage) => {
+    (image: InsertedImage, atRange?: Range): Range | null => {
       const src = sanitizeUrl(image.src ?? '', false);
-      if (!src) return;
+      if (!src) return null;
       const figure = document.createElement('figure');
       figure.className = 'cms-figure';
       const img = document.createElement('img');
@@ -467,7 +429,7 @@ export function RichTextEditor({
         figcaption.textContent = caption;
         figure.appendChild(figcaption);
       }
-      insertBlockElements([figure]);
+      return insertBlockElements([figure], atRange);
     },
     [insertBlockElements],
   );
@@ -477,12 +439,58 @@ export function RichTextEditor({
     () => ({
       insertImage,
       focus: () => {
-        if (sourceMode) return;
-        restoreSelection();
+        if (sourceMode) sourceInputRef.current?.focus();
+        else restoreSelection();
       },
     }),
     [insertImage, restoreSelection, sourceMode],
   );
+
+  const selectedBlock = selectedImage && editorRef.current?.contains(selectedImage)
+    ? selectedImage.closest('figure') ?? selectedImage
+    : null;
+
+  const moveSelectedImage = (direction: 'up' | 'down') => {
+    if (!selectedBlock || !editable.current || uploading > 0) return;
+    const sibling = direction === 'up' ? selectedBlock.previousElementSibling : selectedBlock.nextElementSibling;
+    if (!sibling) return;
+    const parent = selectedBlock.parentNode!;
+    parent.insertBefore(selectedBlock, direction === 'up' ? sibling : sibling.nextSibling);
+    const range = document.createRange();
+    range.setStartAfter(selectedBlock);
+    range.collapse(true);
+    placeCaret(range);
+    sync();
+  };
+
+  const removeSelectedImage = () => {
+    if (!selectedBlock || !editable.current || uploading > 0) return;
+    const range = document.createRange();
+    range.setStartBefore(selectedBlock);
+    range.collapse(true);
+    selectedBlock.remove();
+    ensureEditable();
+    setSelectedImage(null);
+    placeCaret(range);
+    sync();
+  };
+
+  const applyImageDetails = () => {
+    if (!selectedImage || !selectedBlock || !imageDetails || !editable.current) return;
+    selectedImage.alt = imageDetails.alt.trim();
+    if (selectedBlock.tagName === 'FIGURE') {
+      let caption = selectedBlock.querySelector('figcaption');
+      if (imageDetails.caption.trim()) {
+        if (!caption) {
+          caption = document.createElement('figcaption');
+          selectedBlock.appendChild(caption);
+        }
+        caption.textContent = imageDetails.caption.trim();
+      } else caption?.remove();
+    }
+    setImageDetails(null);
+    sync();
+  };
 
   /* ---------------------------------------------------------------- */
   /* Inline code (no execCommand equivalent exists)                    */
@@ -642,65 +650,147 @@ export function RichTextEditor({
 
   const insertPayload = useCallback(
     (html: string) => {
-      if (!html) return;
-      restoreSelection();
-      try {
-        document.execCommand('insertHTML', false, html);
-      } catch {
-        return;
-      }
+      const editor = editorRef.current;
+      if (!editor || !html || !editable.current) return;
+      const range = restoreSelection();
+      if (!range) return;
+      const caret = insertEditorHtml(editor, range, html);
+      if (caret) placeCaret(caret);
       sync();
+      updateToolbar();
     },
-    [restoreSelection, sync],
+    [placeCaret, restoreSelection, sync, updateToolbar],
   );
-
-  const onPaste = (event: ClipboardEvent<HTMLDivElement>) => {
-    // Pasting from Word/Docs/Notion brings styles and scripts the API strips
-    // anyway, so clean it here and the editor keeps showing the truth.
-    event.preventDefault();
-    const clipboard = event.clipboardData;
-    if (!clipboard) return;
-    const html = clipboard.getData('text/html');
-    if (html) {
-      insertPayload(sanitizeBlogHtml(html));
-      return;
-    }
-    const text = clipboard.getData('text/plain');
-    if (text) insertPayload(plainTextToHtml(text));
-  };
 
   const uploadFiles = useCallback(
-    async (files: File[]) => {
-      if (!onUploadFile || !files.length) return;
+    (files: File[]) => {
+      const owner = editorRef.current;
+      if (!onUploadFile || !files.length || !owner || !editable.current) return;
+      saveSelection();
+      const version = documentVersion.current;
+      const insertion = savedRange.current?.cloneRange() ?? editorEnd(owner);
+      // Uploads can take time. Never delete text that was selected (or typed)
+      // while waiting for a screenshot to arrive.
+      insertion.collapse(false);
+      const previous = uploadAnchor.current;
+      // Rapid successive pastes at the same caret share a moving anchor, so
+      // the second queued screenshot appears after the first, not before it.
+      const anchor = previous && previous.owner === owner && previous.version === version && sameRange(previous.range, insertion)
+        ? previous
+        : { owner, version, range: insertion };
+      uploadAnchor.current = anchor;
+      setUploadError(null);
       setUploading(current => current + files.length);
-      for (const file of files) {
-        try {
-          const image = await onUploadFile(file);
-          if (image) insertImage(image);
-        } finally {
-          setUploading(current => Math.max(0, current - 1));
+      uploadQueue.current = uploadQueue.current.then(async () => {
+        for (const [index, file] of files.entries()) {
+          try {
+            if (!mounted.current || editorRef.current !== owner || documentVersion.current !== version) continue;
+            const image = await onUploadFile(file);
+            if (!mounted.current || editorRef.current !== owner) continue;
+            if (documentVersion.current !== version) {
+              setUploadError('The article changed while the image was uploading. It was not inserted; you can select the uploaded image from the media library.');
+              continue;
+            }
+            if (image) anchor.range = insertImage(image, anchor.range) ?? anchor.range;
+          } catch (error) {
+            const problem = describeUploadError(error);
+            if (mounted.current) setUploadError([problem.message, problem.detail].filter(Boolean).join(' '));
+            if (problem.kind === 'storage' || problem.kind === 'rate') {
+              // Every remaining file would fail for the same server-side reason.
+              if (mounted.current) setUploading(current => Math.max(0, current - (files.length - index - 1)));
+              break;
+            }
+          } finally {
+            if (mounted.current) setUploading(current => Math.max(0, current - 1));
+          }
         }
-      }
+      });
     },
-    [insertImage, onUploadFile],
+    [insertImage, onUploadFile, saveSelection],
   );
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
+    onUploadingChange?.(uploading);
+  }, [onUploadingChange, uploading]);
+
+  const onFileInput = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    uploadFiles(files);
+  };
+
+  const onPaste = (event: ClipboardEvent<HTMLDivElement>) => {
+    if (!editable.current) return;
+    event.preventDefault();
+    saveSelection();
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+    // Screenshots often include an unusable blob/file URL in text/html. Prefer
+    // the real clipboard bytes and upload those, rather than a broken image.
+    const files = Array.from(clipboard.files ?? []).filter(file => file.type.startsWith('image/'));
+    if (!files.length) {
+      for (const item of Array.from(clipboard.items ?? [])) {
+        if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length && onUploadFile) {
+      uploadFiles(files);
+      return;
+    }
+    const html = clipboard.getData('text/html');
+    if (html) insertPayload(html);
+    else {
+      const text = clipboard.getData('text/plain');
+      if (text) insertPayload(plainTextToHtml(text));
+    }
+  };
 
   const onDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     setDragging(false);
-    if (disabled) return;
-    const files = Array.from(event.dataTransfer?.files ?? []).filter(file => file.type.startsWith('image/') || !file.type);
-    if (files.length) {
-      void uploadFiles(files);
+    if (!editable.current) return;
+    const editor = editorRef.current;
+    // Dropping has a position of its own; don't reuse the last typing caret.
+    const hitDocument = document as Document & {
+      caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+      caretRangeFromPoint?: (x: number, y: number) => Range | null;
+    };
+    const position = hitDocument.caretPositionFromPoint?.(event.clientX, event.clientY);
+    let dropRange = hitDocument.caretRangeFromPoint?.(event.clientX, event.clientY) ?? null;
+    if (position) {
+      dropRange = document.createRange();
+      dropRange.setStart(position.offsetNode, position.offset);
+      dropRange.collapse(true);
+    }
+    if (editor && rangeIsInEditor(editor, dropRange)) placeCaret(dropRange);
+    else saveSelection();
+    const moving = draggedImage.current;
+    draggedImage.current = null;
+    if (moving && editor?.contains(moving)) {
+      if (uploading > 0 || dropRange && moving.contains(dropRange.startContainer)) return;
+      // Move the existing figure, including its caption, instead of pasting a
+      // duplicate of the browser's dragged-image HTML.
+      insertBlockElements([moving]);
+      return;
+    }
+    const files = Array.from(event.dataTransfer?.files ?? []);
+    if (files.length && onUploadFile) {
+      uploadFiles(files);
       return;
     }
     const html = event.dataTransfer?.getData('text/html');
-    if (html) {
-      insertPayload(sanitizeBlogHtml(html));
-      return;
+    if (html) insertPayload(html);
+    else {
+      const text = event.dataTransfer?.getData('text/plain');
+      if (text) insertPayload(plainTextToHtml(text));
     }
-    const text = event.dataTransfer?.getData('text/plain');
-    if (text) insertPayload(plainTextToHtml(text));
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -717,27 +807,32 @@ export function RichTextEditor({
 
   const enterSourceMode = () => {
     saveSelection();
-    setSourceDraft(sanitizeBlogHtml(value ?? ''));
+    const html = editorRef.current?.innerHTML ?? value ?? '';
+    setSourceDraft(isEmptyMarkup(html) ? '' : sanitizeBlogHtml(html));
     setSourceNotice(null);
     setSourceMode(true);
+    setSelectedImage(null);
   };
 
   const exitSourceMode = () => {
+    if (disabled) return;
     const clean = sanitizeBlogHtml(sourceDraft);
     setSourceNotice(
       clean === sourceDraft.trim()
         ? null
-        : 'Some HTML was removed. The blog only keeps safe tags — scripts, inline styles, iframes and non-https images are stripped.',
+        : 'Some HTML was removed or normalized. Scripts, event handlers, inline styles and embeds are not supported.',
     );
     setSourceMode(false);
+    savedRange.current = null;
     /*
      * The contenteditable is unmounted while the textarea is showing, so the
      * change has to be published from here — waiting for the surface would
      * silently throw the edit away.
      */
-    lastHtml.current = clean;
+    const next = isEmptyMarkup(clean) ? '' : clean;
+    lastHtml.current = next;
     hydrated.current = true;
-    onChange(clean);
+    onChange(next);
     const editor = editorRef.current;
     if (editor) {
       editor.innerHTML = clean;
@@ -746,8 +841,31 @@ export function RichTextEditor({
     }
   };
 
+  const updateSourceDraft = (html: string) => {
+    setSourceDraft(html);
+    lastHtml.current = html;
+    // Keep raw, possibly incomplete markup in the form/local backup. The save
+    // and preview pipelines sanitize it without requiring a mode switch.
+    onChange(html);
+  };
+
+  useEffect(() => {
+    if (!sourceMode) return;
+    if (value !== lastHtml.current) {
+      setSourceDraft(value ?? '');
+      lastHtml.current = value ?? '';
+    }
+  }, [sourceMode, value]);
+
+  useEffect(() => {
+    if (!sourceMode) return;
+    const text = htmlToPlainText(sanitizeBlogHtml(sourceDraft));
+    const words = countWords(text);
+    setStats({ words, characters: text.length, minutes: readingMinutes(words) });
+  }, [sourceDraft, sourceMode]);
+
   const tooLarge = (value ?? '').length > HTML_SOFT_LIMIT;
-  const canInsertImage = !disabled && Boolean(onPickImage || onUploadFile);
+  const visualDisabled = disabled || sourceMode;
 
   /* ---------------------------------------------------------------- */
   /* Render                                                            */
@@ -757,95 +875,122 @@ export function RichTextEditor({
     <div className={`rte${disabled ? ' rte-disabled' : ''}${invalid ? ' rte-invalid' : ''}`}>
       <div className="rte-toolbar" role="toolbar" aria-label="Text formatting" aria-controls={surfaceId}>
         <div className="rte-group">
-          <ToolButton disabled={disabled} label="Paragraph" active={toolbar.block === 'p' || toolbar.block === 'div' || toolbar.block === 'body'} onClick={() => exec('formatBlock', '<p>')}>
+          <ToolButton disabled={visualDisabled} label="Paragraph" active={toolbar.block === 'p' || toolbar.block === 'div' || toolbar.block === 'body'} onClick={() => exec('formatBlock', '<p>')}>
             <span className="rte-glyph" aria-hidden="true">
               ¶
             </span>
           </ToolButton>
-          <ToolButton disabled={disabled} label="Section heading" active={toolbar.block === 'h2'} onClick={() => exec('formatBlock', '<h2>')}>
+          <ToolButton disabled={visualDisabled} label="Section heading" active={toolbar.block === 'h2'} onClick={() => exec('formatBlock', '<h2>')}>
             <Heading2 size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Subheading" active={toolbar.block === 'h3'} onClick={() => exec('formatBlock', '<h3>')}>
+          <ToolButton disabled={visualDisabled} label="Subheading" active={toolbar.block === 'h3'} onClick={() => exec('formatBlock', '<h3>')}>
             <Heading3 size={16} />
           </ToolButton>
         </div>
         <ToolDivider />
         <div className="rte-group">
-          <ToolButton disabled={disabled} label="Bold" shortcut="Ctrl/⌘ + B" active={toolbar.bold} onClick={() => exec('bold')}>
+          <ToolButton disabled={visualDisabled} label="Bold" shortcut="Ctrl/⌘ + B" active={toolbar.bold} onClick={() => exec('bold')}>
             <Bold size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Italic" shortcut="Ctrl/⌘ + I" active={toolbar.italic} onClick={() => exec('italic')}>
+          <ToolButton disabled={visualDisabled} label="Italic" shortcut="Ctrl/⌘ + I" active={toolbar.italic} onClick={() => exec('italic')}>
             <Italic size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Underline" shortcut="Ctrl/⌘ + U" active={toolbar.underline} onClick={() => exec('underline')}>
+          <ToolButton disabled={visualDisabled} label="Underline" shortcut="Ctrl/⌘ + U" active={toolbar.underline} onClick={() => exec('underline')}>
             <Underline size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Strikethrough" active={toolbar.strike} onClick={() => exec('strikeThrough')}>
+          <ToolButton disabled={visualDisabled} label="Strikethrough" active={toolbar.strike} onClick={() => exec('strikeThrough')}>
             <Strikethrough size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Inline code" active={toolbar.code} onClick={toggleInlineCode}>
+          <ToolButton disabled={visualDisabled} label="Inline code" active={toolbar.code} onClick={toggleInlineCode}>
             <Code size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Clear formatting" onClick={() => exec('removeFormat')}>
+          <ToolButton disabled={visualDisabled} label="Clear formatting" onClick={() => exec('removeFormat')}>
             <RemoveFormatting size={16} />
           </ToolButton>
         </div>
         <ToolDivider />
         <div className="rte-group">
-          <ToolButton disabled={disabled} label="Bulleted list" active={toolbar.bulletList} onClick={() => exec('insertUnorderedList')}>
+          <ToolButton disabled={visualDisabled} label="Bulleted list" active={toolbar.bulletList} onClick={() => exec('insertUnorderedList')}>
             <List size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Numbered list" active={toolbar.orderedList} onClick={() => exec('insertOrderedList')}>
+          <ToolButton disabled={visualDisabled} label="Numbered list" active={toolbar.orderedList} onClick={() => exec('insertOrderedList')}>
             <ListOrdered size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Quote" active={toolbar.block === 'blockquote'} onClick={() => exec('formatBlock', '<blockquote>')}>
+          <ToolButton disabled={visualDisabled} label="Quote" active={toolbar.block === 'blockquote'} onClick={() => exec('formatBlock', '<blockquote>')}>
             <Quote size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Code block" active={toolbar.block === 'pre'} onClick={() => exec('formatBlock', '<pre>')}>
+          <ToolButton disabled={visualDisabled} label="Code block" active={toolbar.block === 'pre'} onClick={() => exec('formatBlock', '<pre>')}>
             <SquareCode size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Divider" onClick={() => insertBlockElements([document.createElement('hr')])}>
+          <ToolButton disabled={visualDisabled} label="Divider" onClick={() => insertBlockElements([document.createElement('hr')])}>
             <Minus size={16} />
           </ToolButton>
         </div>
         <ToolDivider />
         <div className="rte-group">
-          <ToolButton disabled={disabled} label="Add or edit a link" shortcut="Ctrl/⌘ + K" active={toolbar.link} onClick={openLinkDialog}>
+          <ToolButton disabled={visualDisabled} label="Add or edit a link" shortcut="Ctrl/⌘ + K" active={toolbar.link} onClick={openLinkDialog}>
             <Link2 size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled || !toolbar.link} label="Remove link" onClick={removeLink}>
+          <ToolButton disabled={visualDisabled || !toolbar.link} label="Remove link" onClick={removeLink}>
             <Link2Off size={16} />
-          </ToolButton>
-          <ToolButton disabled={disabled || !canInsertImage} label="Insert image" onClick={() => onPickImage?.()}>
-            <ImagePlus size={16} />
           </ToolButton>
         </div>
         <ToolDivider />
         <div className="rte-group">
-          <ToolButton disabled={disabled} label="Undo" shortcut="Ctrl/⌘ + Z" onClick={() => exec('undo')}>
+          <ToolButton disabled={visualDisabled} label="Undo" shortcut="Ctrl/⌘ + Z" onClick={() => exec('undo')}>
             <Undo2 size={16} />
           </ToolButton>
-          <ToolButton disabled={disabled} label="Redo" shortcut="Ctrl/⌘ + Y" onClick={() => exec('redo')}>
+          <ToolButton disabled={visualDisabled} label="Redo" shortcut="Ctrl/⌘ + Y" onClick={() => exec('redo')}>
             <Redo2 size={16} />
-          </ToolButton>
-          <ToolButton disabled={disabled} label={sourceMode ? 'Back to the visual editor' : 'Edit HTML'} active={sourceMode} onClick={() => (sourceMode ? exitSourceMode() : enterSourceMode())}>
-            <Braces size={16} />
           </ToolButton>
         </div>
       </div>
 
+      <div className="rte-insert-bar" role="group" aria-label="Insert content">
+        {onPickImage && (
+          <button type="button" className="btn btn-ghost btn-sm" disabled={visualDisabled || uploading > 0} onMouseDown={event => event.preventDefault()} onClick={() => { saveSelection(); onPickImage(); }}>
+            <ImagePlus size={15} />
+            Insert image
+          </button>
+        )}
+        {onUploadFile && (
+          <button type="button" className="btn btn-ghost btn-sm" disabled={visualDisabled || uploading > 0} onMouseDown={event => event.preventDefault()} onClick={() => { saveSelection(); fileInputRef.current?.click(); }}>
+            <Upload size={15} />
+            Upload images here
+          </button>
+        )}
+        <button type="button" className="btn btn-ghost btn-sm" disabled={visualDisabled || uploading > 0} onMouseDown={event => event.preventDefault()} onClick={() => { saveSelection(); setHtmlDialogOpen(true); }}>
+          <Code size={15} />
+          Insert HTML
+        </button>
+        <button type="button" className={`btn btn-ghost btn-sm${sourceMode ? ' active' : ''}`} aria-label={sourceMode ? 'Back to the visual editor' : 'Edit HTML'} aria-pressed={sourceMode} disabled={disabled || uploading > 0} onMouseDown={event => event.preventDefault()} onClick={() => (sourceMode ? exitSourceMode() : enterSourceMode())}>
+          <Braces size={15} />
+          {sourceMode ? 'Visual editor' : 'HTML source'}
+        </button>
+      </div>
+      <p className="rte-insert-hint">
+        {sourceMode ? 'Edit the whole article as HTML. Save and preview include your latest changes without switching modes.' : 'Click where an image belongs, then insert, upload, paste or drop it. Keep typing below it. Click an image to add a caption or move it; drag it to reorder.'}
+      </p>
+      {onUploadFile && (
+        <input ref={fileInputRef} type="file" accept={ACCEPTED_IMAGE_TYPES} multiple className="visually-hidden" aria-label="Upload inline images" tabIndex={-1} disabled={visualDisabled || uploading > 0} onChange={onFileInput} />
+      )}
+
       {sourceMode ? (
         <div className="rte-source">
           <textarea
+            ref={sourceInputRef}
+            id={surfaceId}
             value={sourceDraft}
-            onChange={event => setSourceDraft(event.target.value)}
+            disabled={disabled}
+            aria-invalid={invalid || undefined}
+            onChange={event => updateSourceDraft(event.target.value)}
             spellCheck={false}
             aria-label="Article HTML"
             placeholder={'<p>Write or paste HTML here…</p>'}
           />
           <div className="rte-source-actions">
-            <span className="rte-hint">Safe tags only — scripts, inline styles, iframes and non-https media are stripped.</span>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={exitSourceMode}>
+            <span className="rte-hint">Supported article HTML only — scripts, event handlers, inline styles and embeds are removed.</span>
+            <button type="button" className="btn btn-ghost btn-sm" disabled={disabled} onClick={exitSourceMode}>
               Back to editor
             </button>
           </div>
@@ -863,7 +1008,17 @@ export function RichTextEditor({
             aria-label={label}
             aria-invalid={invalid || undefined}
             data-placeholder={placeholder}
-            onInput={sync}
+            onInput={() => { setSelectedImage(null); sync(); saveSelection(); }}
+            onClick={event => {
+              const target = event.target;
+              if (target instanceof HTMLImageElement) {
+                setSelectedImage(target);
+                const range = document.createRange();
+                range.setStartAfter(target.closest('figure') ?? target);
+                range.collapse(true);
+                placeCaret(range);
+              } else setSelectedImage(null);
+            }}
             onBlur={saveSelection}
             onKeyUp={saveSelection}
             onMouseUp={() => {
@@ -872,6 +1027,12 @@ export function RichTextEditor({
             }}
             onPaste={onPaste}
             onDrop={onDrop}
+            onDragStart={event => {
+              if (!editable.current || uploading > 0) { event.preventDefault(); return; }
+              const target = event.target;
+              draggedImage.current = target instanceof HTMLImageElement ? target.closest('figure') ?? target : null;
+            }}
+            onDragEnd={() => { draggedImage.current = null; setDragging(false); }}
             onDragOver={event => {
               if (disabled) return;
               event.preventDefault();
@@ -881,7 +1042,7 @@ export function RichTextEditor({
             onKeyDown={onKeyDown}
           />
           {uploading > 0 && (
-            <div className="rte-busy-overlay" role="status">
+            <div className="rte-upload-status" role="status">
               <Loader2 size={16} className="spin" />
               <span>
                 Uploading {uploading} image{uploading === 1 ? '' : 's'}…
@@ -896,11 +1057,30 @@ export function RichTextEditor({
         </div>
       )}
 
+      {selectedBlock && !sourceMode && (
+        <div className="rte-image-actions" role="group" aria-label="Selected image actions">
+          <span>Selected image</span>
+          <button type="button" className="btn btn-ghost btn-xs" disabled={disabled || uploading > 0 || !selectedBlock.previousElementSibling} onMouseDown={event => event.preventDefault()} onClick={() => moveSelectedImage('up')} aria-label="Move image up">
+            <ArrowUp size={14} /> Move up
+          </button>
+          <button type="button" className="btn btn-ghost btn-xs" disabled={disabled || uploading > 0 || !selectedBlock.nextElementSibling} onMouseDown={event => event.preventDefault()} onClick={() => moveSelectedImage('down')} aria-label="Move image down">
+            <ArrowDown size={14} /> Move down
+          </button>
+          <button type="button" className="btn btn-ghost btn-xs" disabled={disabled || uploading > 0} onMouseDown={event => event.preventDefault()} onClick={() => setImageDetails({ alt: selectedImage?.alt ?? '', caption: selectedBlock.querySelector('figcaption')?.textContent ?? '' })}>
+            <Pencil size={14} /> Image details
+          </button>
+          <button type="button" className="btn btn-danger-ghost btn-xs" disabled={disabled || uploading > 0} onMouseDown={event => event.preventDefault()} onClick={removeSelectedImage} aria-label="Remove image from article">
+            <Trash2 size={14} /> Remove
+          </button>
+        </div>
+      )}
+
       {sourceNotice && !sourceMode && (
         <p className="rte-notice" role="status">
           {sourceNotice}
         </p>
       )}
+      {uploadError && <p className="field-error" role="alert">{uploadError}</p>}
       {error && (
         <p className="field-error" role="alert">
           {error}
@@ -919,6 +1099,33 @@ export function RichTextEditor({
         <span aria-hidden="true">·</span>
         <span>{stats.minutes > 0 ? `${stats.minutes} min read` : 'nothing to read yet'}</span>
       </div>
+
+      <Modal
+        open={Boolean(imageDetails)}
+        title="Image details"
+        description="Describe this screenshot for readers using assistive technology and add an optional caption."
+        onClose={() => setImageDetails(null)}
+        size="sm"
+        footer={
+          <>
+            <button type="button" className="btn btn-ghost" onClick={() => setImageDetails(null)}>Cancel</button>
+            <button type="button" className="btn btn-primary" onClick={applyImageDetails} disabled={disabled}>Update image</button>
+          </>
+        }
+      >
+        <label className="field">
+          <span className="field-label">Alt text</span>
+          <input value={imageDetails?.alt ?? ''} onChange={event => setImageDetails(current => current ? { ...current, alt: event.target.value } : null)} maxLength={250} />
+        </label>
+        {selectedBlock?.tagName === 'FIGURE' && (
+          <label className="field">
+            <span className="field-label">Caption</span>
+            <input value={imageDetails?.caption ?? ''} onChange={event => setImageDetails(current => current ? { ...current, caption: event.target.value } : null)} />
+          </label>
+        )}
+      </Modal>
+
+      <HtmlSnippetDialog open={htmlDialogOpen} onClose={() => setHtmlDialogOpen(false)} onInsert={insertPayload} />
 
       <Modal
         open={linkDialog.open}

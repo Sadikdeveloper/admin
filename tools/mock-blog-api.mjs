@@ -4,6 +4,7 @@
  *
  *   node tools/mock-blog-api.mjs                     # listens on 0.0.0.0:3000
  *   MOCK_BLOG_MEDIA=off node tools/mock-blog-api.mjs # simulate "storage not configured" (503)
+ *   MOCK_BLOG_EMPTY=1 node tools/mock-blog-api.mjs   # start with no posts, media or comments
  *
  * It implements the admin auth handshake plus every /admin/blog route from the
  * backend's docs/blog-module.md, with in-memory data, the same envelope
@@ -246,12 +247,20 @@ const mediaAssets = [
   },
 ];
 
+// First-use testing must not rely on seeded content existing.
+if (process.env.MOCK_BLOG_EMPTY === '1') {
+  posts.length = 0;
+  comments.length = 0;
+  mediaAssets.length = 0;
+  mediaStore.clear();
+}
+
 /* ------------------------------------------------------------------ */
 /* HTTP plumbing                                                       */
 /* ------------------------------------------------------------------ */
 
 function send(res, status, payload, headers = {}) {
-  const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const body = typeof payload === 'string' || Buffer.isBuffer(payload) ? payload : JSON.stringify(payload);
   res.writeHead(status, {
     'Content-Type': typeof payload === 'string' ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),

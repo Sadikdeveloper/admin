@@ -1,10 +1,9 @@
 /**
- * An explicitly empty VITE_API_BASE_URL means "use relative URLs", which lets
- * the dev server (or a reverse proxy) forward /admin to the real API. Only an
- * unset variable falls back to the local default.
+ * Same-origin API paths work behind both production reverse proxies and remote
+ * previews. An explicit origin is optional; never default the user's browser
+ * to localhost (which is their machine, not the backend).
  */
-const configuredBase = import.meta.env.VITE_API_BASE_URL;
-export const apiBase = configuredBase === undefined ? 'http://localhost:3000' : configuredBase;
+export const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
 const accessKey = 'rown.admin.access';
 const refreshKey = 'rown.admin.refresh';
 
@@ -198,6 +197,9 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   }
 
   const body = await response.json().catch(() => null);
+  if (response.ok && response.headers.get('Content-Type')?.toLowerCase().includes('text/html')) {
+    throw new ApiError('The server returned a web page instead of API data. Check the API URL and make sure /admin requests are forwarded to the backend.', response.status);
+  }
   if (!response.ok) {
     const messages = serverMessagesOf(body);
     throw new ApiError(friendlyApiError(response.status, messages), response.status, messages);

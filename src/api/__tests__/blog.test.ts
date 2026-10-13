@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, isNetworkError } from '../../api';
+import { ApiError, apiBase, isNetworkError } from '../../api';
 import {
+  BlogEndpointError,
   createPost,
   deleteComment,
   deletePost,
@@ -32,7 +33,7 @@ function stubFetch(...responses: Response[]) {
 
   fetchMock.mock.calls.forEach(([url, init]) => {
     calls.push({
-      url: new URL(String(url)),
+      url: new URL(String(url), window.location.origin),
       method: (init?.method as string) || 'GET',
       body: init?.body,
       headers: init?.headers as Headers,
@@ -44,7 +45,7 @@ function stubFetch(...responses: Response[]) {
 /** Records requests as they happen (the mock is consumed lazily). */
 function recordingFetch(handler: (url: URL, init: RequestInit) => Response) {
   const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
-    const url = new URL(String(input));
+    const url = new URL(String(input), window.location.origin);
     calls.push({ url, method: init?.method || 'GET', body: init?.body, headers: init?.headers as Headers });
     return handler(url, init ?? {});
   });
@@ -297,5 +298,76 @@ describe('errors', () => {
     expect(error.status).toBe(504);
     expect(error.serverMessages).toEqual([]);
     expect(error.message.length).toBeGreaterThan(10);
+  });
+});
+
+
+describe('empty collections versus missing CMS endpoints', () => {
+  it('uses relative API paths by default so a remote browser never calls its own localhost', async () => {
+    const fetchMock = recordingFetch(() => jsonResponse({ data: [] }));
+    await listPosts();
+    expect(apiBase).toBe('');
+    expect(fetchMock.mock.calls[0][0]).toBe('/admin/blog/posts');
+  });
+
+  it('normalizes a valid empty post list even when the backend reports zero pages', async () => {
+    recordingFetch(() => jsonResponse({ data: { items: [], pagination: { page: 1, limit: 12, total: 0, totalPages: 0 } } }));
+    const result = await listPosts({ limit: 12 });
+    expect(result.items).toEqual([]);
+    expect(result.pagination.totalPages).toBe(1);
+    expect(result.pagination.total).toBe(0);
+  });
+
+  it('accepts a 204 empty collection and preserves its requested paging size', async () => {
+    recordingFetch(() => new Response(null, { status: 204 }));
+    const result = await listMedia({ page: 1, limit: 24 });
+    expect(result.items).toEqual([]);
+    expect(result.pagination).toMatchObject({ page: 1, limit: 24, total: 0, totalPages: 1 });
+  });
+
+  it.each([
+    ['posts', listPosts, 'No blog posts found'],
+    ['media', listMedia, 'No media assets found'],
+    ['comments', listComments, 'Blog comments not found'],
+  ] as const)('handles an explicit empty-collection 404 for %s without a deleted-content error', async (_resource, list, message) => {
+    recordingFetch(() => jsonResponse({ statusCode: 404, message }, 404));
+    const result = await list({ page: 1, limit: 12 });
+    expect(result.items).toEqual([]);
+    expect(result.pagination).toMatchObject({ page: 1, limit: 12, total: 0, totalPages: 1 });
+  });
+
+  it('explains a missing GET route instead of treating it as an empty blog', async () => {
+    recordingFetch(() => jsonResponse({ statusCode: 404, message: 'Cannot GET /admin/blog/posts?limit=12', error: 'Not Found' }, 404));
+    const error = await listPosts({ limit: 12 }).catch((error: unknown) => error) as BlogEndpointError;
+    expect(error).toBeInstanceOf(BlogEndpointError);
+    expect(error.status).toBe(404);
+    expect(error.message).toMatch(/content management API is unavailable/i);
+    expect(error.message).toMatch(/blog module|proxy/);
+    expect(error.serverMessages).toEqual(['Cannot GET /admin/blog/posts?limit=12']);
+  });
+
+  it('does not silently turn an ambiguous or HTML 404 into zero posts', async () => {
+    recordingFetch(() => new Response('<html>Not Found</html>', { status: 404, headers: { 'Content-Type': 'text/html' } }));
+    const error = await listPosts().catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(BlogEndpointError);
+  });
+
+  it('does not confuse an unavailable create endpoint with a post that was deleted', async () => {
+    recordingFetch(() => jsonResponse({ message: 'Not Found' }, 404));
+    await expect(createPost({ title: 'First tutorial' })).rejects.toBeInstanceOf(BlogEndpointError);
+  });
+
+  it('distinguishes a missing individual post from a missing endpoint', async () => {
+    recordingFetch(() => jsonResponse({ message: 'Blog post not found' }, 404));
+    const removed = await getPost('missing-id').catch((error: unknown) => error);
+    expect(removed).toBeInstanceOf(ApiError);
+    expect(removed).not.toBeInstanceOf(BlogEndpointError);
+    recordingFetch(() => jsonResponse({ message: 'Cannot GET /admin/blog/posts/missing-id' }, 404));
+    await expect(getPost('missing-id')).rejects.toBeInstanceOf(BlogEndpointError);
+  });
+
+  it('reports a misrouted SPA response rather than displaying a fake empty CMS', async () => {
+    recordingFetch(() => new Response('<html>Admin console</html>', { status: 200, headers: { 'Content-Type': 'text/html' } }));
+    await expect(listPosts()).rejects.toThrow(/web page instead of API data/);
   });
 });

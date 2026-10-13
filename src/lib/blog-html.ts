@@ -92,6 +92,10 @@ const ALLOWED_ATTRS: Record<string, Set<string>> = {
 /** `class` is allowed everywhere by the server, so styling hooks survive. */
 const GLOBAL_ATTRS = new Set(['class']);
 
+// Browsers and pasted HTML often use these older, equally safe tags. Store
+// their semantic equivalents so formatting survives the backend allow-list.
+const TAG_ALIASES = new Map([['b', 'strong'], ['i', 'em'], ['strike', 's']]);
+
 const BLOCK_TAGS = new Set([
   'p',
   'div',
@@ -205,6 +209,15 @@ function unwrapElement(element: Element): void {
 
 function cleanElement(element: Element): void {
   const tag = element.tagName.toLowerCase();
+  const alias = TAG_ALIASES.get(tag);
+  if (alias) {
+    const replacement = element.ownerDocument.createElement(alias);
+    for (const attribute of Array.from(element.attributes)) replacement.setAttribute(attribute.name, attribute.value);
+    while (element.firstChild) replacement.appendChild(element.firstChild);
+    element.replaceWith(replacement);
+    cleanElement(replacement);
+    return;
+  }
   if (DROP_TAGS.has(tag)) {
     element.remove();
     return;

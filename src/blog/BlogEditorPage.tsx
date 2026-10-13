@@ -232,6 +232,7 @@ export function BlogEditorPage({
 
   const [loading, setLoading] = useState(Boolean(postId));
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [notFound, setNotFound] = useState(false);
   const [remoteChange, setRemoteChange] = useState<BlogPost | null>(null);
 
@@ -242,6 +243,10 @@ export function BlogEditorPage({
   const [restoreNote, setRestoreNote] = useState<string | null>(null);
 
   const [saving, setSaving] = useState(false);
+  const [uploadingImages, setUploadingImages] = useState(0);
+  const uploadingImagesRef = useRef(0);
+  const savingLock = useRef(false);
+  uploadingImagesRef.current = uploadingImages;
   const [busyAction, setBusyAction] = useState<SaveThen | 'save' | 'delete' | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -311,7 +316,9 @@ export function BlogEditorPage({
     if (loadedId.current === postId) return;
 
     let alive = true;
-    loadedId.current = postId;
+    // Mark the id as loaded only after a successful response (in applyPost).
+    // StrictMode replays effects: marking an in-flight request here would skip
+    // the replay while its original, cancelled subscription ignores the result.
     setLoading(true);
     setLoadError(null);
     setNotFound(false);
@@ -334,7 +341,7 @@ export function BlogEditorPage({
       .catch(error => {
         if (!alive) return;
         loadedId.current = null;
-        if (error instanceof ApiError && error.status === 404) {
+        if (error instanceof ApiError && error.status === 404 && !(error instanceof blogApi.BlogEndpointError)) {
           setNotFound(true);
           clearDraft(postId);
           return;
@@ -348,7 +355,7 @@ export function BlogEditorPage({
     return () => {
       alive = false;
     };
-  }, [postId, applyPost]);
+  }, [postId, applyPost, loadAttempt]);
 
   /* ---- starting a new post ---- */
 
@@ -357,6 +364,8 @@ export function BlogEditorPage({
     initializedNew.current = true;
 
     const draft = readDraft(null);
+    // A pre-filled author is a default, not an edit made by the writer.
+    setBaseline(JSON.stringify({ ...BLANK_POST_FORM, authorName: adminLabel || '' }));
     setForm(current => ({
       ...current,
       authorName: current.authorName || adminLabel || '',
@@ -370,7 +379,7 @@ export function BlogEditorPage({
   /* ---- device-local backup ---- */
 
   useEffect(() => {
-    if (loading || notFound) return;
+    if (loading || notFound || loadError) return;
     const timer = window.setTimeout(() => {
       if (JSON.stringify(formRef.current) === baseline) {
         clearDraft(postId);
@@ -380,31 +389,33 @@ export function BlogEditorPage({
       if (!result.ok && result.error) setStorageWarning(result.error);
     }, 1000);
     return () => window.clearTimeout(timer);
-  }, [form, baseline, postId, loading, notFound]);
+  }, [form, baseline, postId, loading, notFound, loadError]);
 
   /* ---- guards against losing work ---- */
 
   useEffect(() => {
-    if (!dirty || loading) return;
+    if ((!dirty && uploadingImages === 0) || loading) return;
     const ownHash = routeToHash({ name: 'blog-editor', postId });
     return navGuard.register(target =>
       routeToHash(target) === ownHash
         ? null
-        : postId
+        : uploadingImages > 0
+          ? 'Images are still uploading. Leaving now will stop them from being added to this article.'
+          : postId
           ? 'You have unsaved changes on this post. A copy stays on this device, but the server will not have them.'
           : 'This new post has not been saved yet. A copy stays on this device, but the server will not have it.',
     );
-  }, [dirty, postId, loading]);
+  }, [dirty, uploadingImages, postId, loading]);
 
   useEffect(() => {
-    if (!dirty) return;
+    if (!dirty && uploadingImages === 0) return;
     const handler = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = '';
     };
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
-  }, [dirty]);
+  }, [dirty, uploadingImages]);
 
   /* ---- noticing edits made somewhere else ---- */
 
@@ -435,6 +446,11 @@ export function BlogEditorPage({
 
   const save = useCallback(
     async (options: { then?: SaveThen; publishAt?: string; quiet?: boolean } = {}): Promise<boolean> => {
+      if (savingLock.current) return false;
+      if (uploadingImagesRef.current > 0) {
+        toast.info('Images are still uploading', 'Wait for the uploads to finish before saving or publishing this article.');
+        return false;
+      }
       const publishing = options.then === 'publish' || options.then === 'schedule';
       const fieldErrors = validateForm(formRef.current, { publishing });
       setErrors(fieldErrors);
@@ -448,6 +464,7 @@ export function BlogEditorPage({
       }
 
       const target = options.then ?? 'save';
+      savingLock.current = true;
       setBusyAction(target);
       setSaving(true);
       setBanner(null);
@@ -512,6 +529,12 @@ export function BlogEditorPage({
             if (!options.quiet) toast.error('The server rejected these changes', error.serverMessages[0] ?? error.message);
             return false;
           }
+          if (error.status === 404 && (error instanceof blogApi.BlogEndpointError || !(postRef.current?.id ?? postId))) {
+            const message = error instanceof blogApi.BlogEndpointError ? error.message : new blogApi.BlogEndpointError('/admin/blog/posts', error.serverMessages).message;
+            setBanner(message);
+            if (!options.quiet) toast.error('Content management is unavailable', message);
+            return false;
+          }
           if (error.status === 404) {
             setBanner('This post no longer exists — someone may have deleted it.');
             if (!options.quiet) toast.error('This post no longer exists');
@@ -523,6 +546,7 @@ export function BlogEditorPage({
         if (!options.quiet) toast.error('Save failed', message);
         return false;
       } finally {
+        savingLock.current = false;
         setSaving(false);
         setBusyAction(null);
       }
@@ -532,6 +556,10 @@ export function BlogEditorPage({
 
   /** Publishes straight away, saving first when there is unsaved work. */
   const publishNow = useCallback(async () => {
+    if (uploadingImagesRef.current > 0 || savingLock.current) {
+      if (uploadingImagesRef.current > 0) toast.info('Images are still uploading', 'Wait for the uploads to finish before publishing.');
+      return;
+    }
     if (isPublished && !dirty) {
       setBusyAction('publish');
       try {
@@ -594,13 +622,13 @@ export function BlogEditorPage({
       onNavigate({ name: 'blog' });
     } catch (error) {
       const message =
-        error instanceof ApiError && error.status === 404
+        error instanceof ApiError && error.status === 404 && !(error instanceof blogApi.BlogEndpointError)
           ? 'That post was already deleted.'
           : error instanceof Error
             ? error.message
             : 'The post could not be deleted.';
       toast.error(message);
-      if (error instanceof ApiError && error.status === 404) onNavigate({ name: 'blog' });
+      if (error instanceof ApiError && error.status === 404 && !(error instanceof blogApi.BlogEndpointError)) onNavigate({ name: 'blog' });
     } finally {
       setDeleting(false);
       setConfirmDelete(false);
@@ -642,7 +670,9 @@ export function BlogEditorPage({
             ? (error as unknown as { problem: { message: string; detail?: string } }).problem
             : { message: error instanceof Error ? error.message : 'The image could not be uploaded.' };
         toast.error(problem.message, problem.detail);
-        return null;
+        // Let the editor show the failure inline and stop a bulk upload when
+        // storage is missing or the server rate-limits the queue.
+        throw error;
       }
     },
     [toast],
@@ -745,6 +775,32 @@ export function BlogEditorPage({
     );
   }
 
+  if (loadError && !post) {
+    return (
+      <>
+        <header className="content-head">
+          <div>
+            <p className="eyebrow">CONTENT / BLOG</p>
+            <h1>Could not load this post</h1>
+            <p className="subtle">Your local backup has been kept. Try again when the content API is available.</p>
+          </div>
+        </header>
+        <div className="banner banner-error page-banner" role="alert">
+          <CircleAlert size={16} className="banner-ico" />
+          <span>{loadError}</span>
+        </div>
+        <div className="panel inline-empty">
+          <button type="button" className="btn btn-primary btn-sm" onClick={() => setLoadAttempt(current => current + 1)}>
+            <RefreshCw size={14} /> Try again
+          </button>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => onNavigate({ name: 'blog' })}>
+            <ArrowLeft size={14} /> Back to all posts
+          </button>
+        </div>
+      </>
+    );
+  }
+
   if (notFound) {
     return (
       <>
@@ -797,7 +853,7 @@ export function BlogEditorPage({
               <ExternalLink size={16} />
             </a>
           )}
-          <button type="button" className="btn btn-ghost" onClick={() => void save({})} disabled={saving || Boolean(busyAction)}>
+          <button type="button" className="btn btn-ghost" onClick={() => void save({})} disabled={saving || Boolean(busyAction) || uploadingImages > 0}>
             {saving && busyAction === 'save' ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
             <span className="btn-label">{postId ? 'Save' : 'Save draft'}</span>
           </button>
@@ -805,7 +861,7 @@ export function BlogEditorPage({
             type="button"
             className="btn btn-primary"
             onClick={() => void (isPublished ? save({}) : publishNow())}
-            disabled={saving || Boolean(busyAction)}
+            disabled={saving || Boolean(busyAction) || uploadingImages > 0}
             title={isPublished ? 'Save changes (Ctrl/⌘ + S)' : 'Publish now (Ctrl/⌘ + Enter)'}
           >
             {busyAction === 'publish' ? <Loader2 size={15} className="spin" /> : <Send size={15} />}
@@ -1004,7 +1060,7 @@ export function BlogEditorPage({
                 <h2>Content</h2>
               </div>
               <span className="editor-content-note">
-                {wordCount.toLocaleString()} words · images can be dragged in
+                {wordCount.toLocaleString()} words · add images between your steps
               </span>
             </div>
             <RichTextEditor
@@ -1013,9 +1069,11 @@ export function BlogEditorPage({
               onChange={html => patch({ html })}
               onPickImage={() => setPicker({ open: true, target: 'inline' })}
               onUploadFile={uploadForEditor}
+              onUploadingChange={setUploadingImages}
+              disabled={saving || Boolean(busyAction)}
               invalid={Boolean(errors.content)}
               error={errors.content}
-              placeholder="Write the article. Use the toolbar for headings, lists, quotes, links and images."
+              placeholder="Start your tutorial here. Insert screenshots and HTML wherever they belong as you write."
             />
           </section>
         </div>
@@ -1052,7 +1110,7 @@ export function BlogEditorPage({
                 type="button"
                 className="btn btn-primary btn-block"
                 onClick={() => void (isPublished ? save({}) : publishNow())}
-                disabled={saving || Boolean(busyAction)}
+                disabled={saving || Boolean(busyAction) || uploadingImages > 0}
               >
                 {busyAction === 'publish' || (saving && busyAction === 'save') ? (
                   <Loader2 size={15} className="spin" />
@@ -1067,7 +1125,7 @@ export function BlogEditorPage({
                   type="button"
                   className="btn btn-ghost btn-block"
                   onClick={() => void save({})}
-                  disabled={saving || Boolean(busyAction)}
+                  disabled={saving || Boolean(busyAction) || uploadingImages > 0}
                 >
                   {saving ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
                   Save draft
@@ -1086,7 +1144,7 @@ export function BlogEditorPage({
                     setScheduleValue(toLocalInputValue(target));
                   }
                 }}
-                disabled={saving || Boolean(busyAction)}
+                disabled={saving || Boolean(busyAction) || uploadingImages > 0}
                 aria-expanded={scheduleOpen}
               >
                 <CalendarClock size={15} />
@@ -1098,7 +1156,7 @@ export function BlogEditorPage({
                   type="button"
                   className="btn btn-ghost btn-block"
                   onClick={() => void unpublish()}
-                  disabled={saving || Boolean(busyAction)}
+                  disabled={saving || Boolean(busyAction) || uploadingImages > 0}
                 >
                   {busyAction === 'draft' ? <Loader2 size={15} className="spin" /> : <X size={15} />}
                   Unpublish
@@ -1146,7 +1204,7 @@ export function BlogEditorPage({
                     type="button"
                     className="btn btn-primary btn-sm"
                     onClick={() => void applySchedule()}
-                    disabled={saving || Boolean(busyAction)}
+                    disabled={saving || Boolean(busyAction) || uploadingImages > 0}
                   >
                     {busyAction === 'schedule' ? <Loader2 size={14} className="spin" /> : <CalendarClock size={14} />}
                     {state === 'scheduled' ? 'Update schedule' : 'Schedule post'}
@@ -1156,7 +1214,7 @@ export function BlogEditorPage({
             )}
 
             {post && (
-              <button type="button" className="btn btn-danger-ghost btn-block delete-post" onClick={() => setConfirmDelete(true)} disabled={deleting}>
+              <button type="button" className="btn btn-danger-ghost btn-block delete-post" onClick={() => setConfirmDelete(true)} disabled={deleting || uploadingImages > 0}>
                 <Trash2 size={14} />
                 Delete this post
               </button>
@@ -1195,6 +1253,7 @@ export function BlogEditorPage({
           <section className="panel editor-panel">
             <p className="eyebrow">COVER</p>
             <h2>Cover image</h2>
+            <p className="field-hint">Optional thumbnail for post listings. Add tutorial screenshots inside Content using “Insert image”.</p>
             <CoverImageField
               url={form.coverImageUrl}
               alt={form.coverImageAlt}
@@ -1301,7 +1360,7 @@ export function BlogEditorPage({
       </div>
 
       <div className="editor-mobile-bar">
-        <button type="button" className="btn btn-ghost" onClick={() => void save({})} disabled={saving || Boolean(busyAction)}>
+        <button type="button" className="btn btn-ghost" onClick={() => void save({})} disabled={saving || Boolean(busyAction) || uploadingImages > 0}>
           {saving ? <Loader2 size={15} className="spin" /> : <Save size={15} />}
           Save
         </button>
@@ -1309,7 +1368,7 @@ export function BlogEditorPage({
           type="button"
           className="btn btn-primary"
           onClick={() => void (isPublished ? save({}) : publishNow())}
-          disabled={saving || Boolean(busyAction)}
+          disabled={saving || Boolean(busyAction) || uploadingImages > 0}
         >
           <Send size={15} />
           {isPublished ? 'Save changes' : 'Publish'}

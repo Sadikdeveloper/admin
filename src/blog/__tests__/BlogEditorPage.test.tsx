@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { StrictMode } from 'react';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import * as blogApi from '../../api/blog';
 import type { BlogPost } from '../../api/blog';
@@ -7,6 +8,7 @@ import { ToastProvider } from '../../components/Toast';
 import { BLANK_POST_FORM } from '../../lib/blog-draft';
 import { navGuard } from '../../lib/nav-guard';
 import { BlogEditorPage } from '../BlogEditorPage';
+import { uploadBlogImage } from '../../lib/blog-images';
 
 vi.mock('../../api/blog', async importOriginal => {
   const actual = await importOriginal<typeof import('../../api/blog')>();
@@ -85,6 +87,8 @@ function writeArticle(html: string) {
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  navGuard.clear();
+  navGuard.check({ name: 'blog' }); // consume address-swap allowances left by mocked navigation
   vi.mocked(blogApi.getPost).mockResolvedValue(post());
   vi.mocked(blogApi.createPost).mockImplementation(input =>
     Promise.resolve(post({ id: 'new-id', title: input.title ?? '', slug: 'generated-slug' })),
@@ -406,5 +410,124 @@ describe('BlogEditorPage · preview', () => {
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText('Preview me')).toBeTruthy();
     expect(dialog.innerHTML).toContain('Preview body');
+  });
+});
+
+
+describe('BlogEditorPage · tutorial content and first use', () => {
+  it('never asks for an individual post when opening a brand-new article', () => {
+    renderEditor(null);
+    expect(blogApi.getPost).not.toHaveBeenCalled();
+    expect(screen.queryByRole('heading', { name: 'Post not found' })).toBeNull();
+  });
+
+  it('saves the latest HTML-source edits without leaving source mode, preserving screenshot order', async () => {
+    renderEditor(null);
+    fireEvent.change(titleInput(), { target: { value: 'A transfer tutorial' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Edit HTML' }));
+    const html = '<h2>Step one</h2><p><b>Open the form</b></p><figure><img src="/step-one.png" alt="Form"></figure><p>Enter the recipient</p><figure><img src="/step-two.png" alt="Recipient"><figcaption>Check the address</figcaption></figure><p onclick="bad()">Confirm</p><script>bad()</script>';
+    fireEvent.change(screen.getByLabelText('Article HTML'), { target: { value: html } });
+    fireEvent.click(button(/save draft/i));
+    await waitFor(() => expect(blogApi.createPost).toHaveBeenCalledTimes(1));
+    const input = vi.mocked(blogApi.createPost).mock.calls[0][0];
+    expect(input.contentHtml).toContain('<strong>Open the form</strong>');
+    expect(input.contentHtml).not.toMatch(/onclick|<script/);
+    const saved = new DOMParser().parseFromString(input.contentHtml!, 'text/html');
+    expect(Array.from(saved.querySelectorAll('img')).map(img => img.getAttribute('src'))).toEqual(['/step-one.png', '/step-two.png']);
+    expect(input.content).toMatchObject({ type: 'doc', content: [
+      { type: 'heading' },
+      { type: 'paragraph' },
+      { type: 'image', attrs: { src: '/step-one.png', alt: 'Form' } },
+      { type: 'paragraph' },
+      { type: 'image', attrs: { src: '/step-two.png', caption: 'Check the address' } },
+      { type: 'paragraph' },
+    ] });
+  });
+
+  it('previews source-mode edits immediately and keeps unsafe HTML out of the preview', async () => {
+    renderEditor(null);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit HTML' }));
+    fireEvent.change(screen.getByLabelText('Article HTML'), { target: { value: '<p onclick="bad()">Latest source text</p><script>bad()</script>' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview as a reader' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Reader preview' });
+    expect(within(dialog).getByText('Latest source text')).toBeTruthy();
+    expect(dialog.innerHTML).not.toMatch(/onclick|<script/);
+  });
+
+  it('backs up source changes even before they are applied to the visual editor', async () => {
+    vi.useFakeTimers();
+    renderEditor(null);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit HTML' }));
+    const raw = '<h2>Unfinished tutorial</h2><p>Continue here';
+    fireEvent.change(screen.getByLabelText('Article HTML'), { target: { value: raw } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1100); });
+    const backup = JSON.parse(localStorage.getItem('rown.blog.draft.new')!);
+    expect(backup.form.html).toBe(raw);
+    expect(navGuard.check({ name: 'blog' })).toMatch(/has not been saved/);
+  });
+
+  it('waits for inline uploads before saving, including keyboard shortcuts', async () => {
+    let finish!: (asset: Awaited<ReturnType<typeof uploadBlogImage>>) => void;
+    vi.mocked(uploadBlogImage).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    renderEditor(null);
+    fireEvent.change(titleInput(), { target: { value: 'With a screenshot' } });
+    writeArticle('<p>Instruction one</p>');
+    const file = new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], 'step.png', { type: 'image/png' });
+    fireEvent.change(screen.getByLabelText('Upload inline images'), { target: { files: [file] } });
+    await waitFor(() => expect(uploadBlogImage).toHaveBeenCalledWith(file));
+    expect(screen.getAllByRole('button', { name: 'Save draft' }).every(node => node.hasAttribute('disabled'))).toBe(true);
+    fireEvent.keyDown(window, { key: 's', ctrlKey: true });
+    expect(blogApi.createPost).not.toHaveBeenCalled();
+    await act(async () => finish({ id: 'm1', publicUrl: '/uploaded.png', storageKey: 'step.png', contentType: 'image/png', sizeBytes: 8, uploadedByAdminAddress: '0x1', createdAt: new Date().toISOString() }));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Save draft' }).every(node => !node.hasAttribute('disabled'))).toBe(true));
+    fireEvent.click(button(/save draft/i));
+    await waitFor(() => expect(blogApi.createPost).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(blogApi.createPost).mock.calls[0][0].contentHtml).toContain('/uploaded.png');
+  });
+
+  it('does not call a failed first save a deleted post', async () => {
+    vi.mocked(blogApi.createPost).mockRejectedValue(new ApiError('Not found', 404));
+    renderEditor(null);
+    fireEvent.change(titleInput(), { target: { value: 'My first post' } });
+    fireEvent.click(button(/save draft/i));
+    await waitFor(() => expect(blogApi.createPost).toHaveBeenCalledTimes(1));
+    expect((await screen.findAllByText(/content management API is unavailable/i)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/this post no longer exists/i)).toBeNull();
+    expect(titleInput().value).toBe('My first post');
+  });
+
+  it('keeps a local backup when the endpoint is missing and can retry once it is available', async () => {
+    vi.useFakeTimers();
+    const backup = JSON.stringify({ version: 1, savedAt: '2099-01-01T00:00:00.000Z', form: { ...BLANK_POST_FORM, title: 'Local tutorial', html: '<p>Do not lose this</p>' } });
+    localStorage.setItem(`rown.blog.draft.${POST_ID}`, backup);
+    vi.mocked(blogApi.getPost).mockRejectedValueOnce(new blogApi.BlogEndpointError(`/admin/blog/posts/${POST_ID}`));
+    renderEditor(POST_ID);
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole('heading', { name: 'Could not load this post' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Post not found' })).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1100); });
+    expect(localStorage.getItem(`rown.blog.draft.${POST_ID}`)).toBe(backup);
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await act(async () => { await Promise.resolve(); });
+    expect(blogApi.getPost).toHaveBeenCalledTimes(2);
+    expect(titleInput().value).toBe('Stored post');
+    expect(screen.getByText(/unsaved edits from/i)).toBeTruthy();
+  });
+});
+
+
+describe('BlogEditorPage · mount and empty defaults', () => {
+  it('does not count a pre-filled author as content or unsaved work', () => {
+    renderEditor(null);
+    expect(screen.queryByText('Unsaved changes')).toBeNull();
+    expect(article().innerHTML).toBe('<p><br></p>');
+    expect(navGuard.check({ name: 'blog' })).toBeNull();
+  });
+
+  it('loads an existing article when effects are replayed under StrictMode', async () => {
+    render(<StrictMode><ToastProvider><BlogEditorPage postId={POST_ID} adminLabel="Operator" onNavigate={vi.fn()} /></ToastProvider></StrictMode>);
+    await waitFor(() => expect(titleInput().value).toBe('Stored post'));
+    expect(article().innerHTML).toBe('<p>Stored body</p>');
+    expect(screen.queryByRole('heading', { name: 'Loading post…' })).toBeNull();
   });
 });

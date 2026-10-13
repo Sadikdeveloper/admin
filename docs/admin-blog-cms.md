@@ -37,11 +37,11 @@ npm test           # vitest (jsdom), 185 tests
 
 ### Environment
 
-All three variables are optional and documented in `.env.example`.
+The environment variables are documented in `.env.example`.
 
 | Variable | Purpose |
 | --- | --- |
-| `VITE_API_BASE_URL` | API origin. Set it to `""` to use relative URLs and let a proxy forward `/admin` (required behind remote previews). Unset falls back to `http://localhost:3000`. |
+| `VITE_API_BASE_URL` | Optional API origin. Empty or unset uses same-origin `/admin` paths; forward those to the backend with a dev or production proxy. It never defaults the browser to localhost. An explicit origin can include a backend route prefix. |
 | `VITE_DEV_API_PROXY` | Dev server only: forwards the proxy paths to this backend. |
 | `VITE_DEV_PROXY_PATHS` | Comma-separated paths to proxy (default `/admin`). |
 | `VITE_PUBLIC_SITE_URL` | Where readers see the blog. Enables “View live post”, “Copy link” and the public link on comments. Without it those actions fall back to copying the slug. |
@@ -57,6 +57,7 @@ path that serves uploaded bytes back so images really render.
 
 ```bash
 node tools/mock-blog-api.mjs                      # 0.0.0.0:3000
+MOCK_BLOG_EMPTY=1 node tools/mock-blog-api.mjs    # no posts, images or comments
 MOCK_BLOG_MEDIA=off node tools/mock-blog-api.mjs  # reproduce the "storage not configured" 503
 
 VITE_API_BASE_URL= \
@@ -95,6 +96,30 @@ the session is cleared and the operator is asked to sign in again.
 ---
 
 ## Edge cases and how they are handled
+
+**A CMS with no content yet.** Successful empty collections (`items: []`, a
+bare array, `data: null` or a 204) show the first-use empty state with the
+appropriate create/upload action. Pagination with `totalPages: 0` is normalized
+to one empty page; a stale stored page is clamped. Older servers that explicitly
+reply 404 with “No blog posts found”, “No media assets found” or “Blog comments
+not found” are also handled as empty collections, only on collection GETs.
+Count probes are optional: a failed published/draft count cannot hide a valid
+post list or its first-post action.
+
+**A missing CMS endpoint is not empty content.** The old “We couldn't find what
+you were looking for” text came from the shared API's generic 404 mapping.
+`BlogEndpointError` now explains missing collection routes, missing create or
+upload routes, and Nest's `Cannot GET/POST/PATCH/DELETE …` responses as content-API
+setup problems. They are never silently changed into an empty database, nor
+called deleted articles. A real missing post still has the “Post not found”
+screen. Failed loads keep device-local backups and offer a retry. An HTML SPA
+page returned instead of API JSON reports an API/proxy routing problem.
+
+If a live deployment still replies `Cannot GET /admin/blog/posts`, the **backend
+blog module must be deployed/enabled and the API base URL or `/admin` proxy must
+be corrected**. This frontend repository cannot install routes on a separate
+backend. Check the request and response in the browser's Network panel; a
+working empty backend should return 200 with `items: []` and a zero total.
 
 **Empty content.** Publishing is blocked in the browser first: `<p><br></p>`,
 whitespace and zero-width placeholders count as empty, so the operator sees
@@ -178,13 +203,48 @@ and sanitized HTML (`contentHtml`).
   so a document written by another client cannot smuggle markup back in.
 - `src/lib/blog-html.ts` holds the allow-list mirroring the backend's
   `blog-content.ts`.
-- The editor is a `contenteditable` surface with a toolbar (paragraph, H2/H3,
-  bold, italic, underline, strike, inline code, clear formatting, lists, quote,
-  code block, divider, link, image, undo/redo) plus an HTML source mode that
-  sanitizes on the way out, keyboard shortcuts, paste/drop cleaning, and an
-  image uploader.
+- The editor is a `contenteditable` surface with a formatting toolbar and
+  visible **Insert image**, **Upload images here**, **Insert HTML** and **HTML
+  source** actions. DOM insertion is shared in `src/lib/blog-editor.ts`.
+- Images split the paragraph at the chosen cursor, not at the article end.
+  There is a typing paragraph immediately below each image; numbered-list
+  steps and table cells keep their screenshots inside the same container.
+- File uploads, dropped files and pasted screenshots use the same validation
+  and media API. Uploads are queued sequentially and keep their original
+  insertion point even when the writer keeps typing. Multiple images retain
+  their order, including rapid successive pastes at one cursor. A delayed
+  result never writes into an externally replaced article. Saving/publishing
+  waits until uploads finish; storage/rate failures stop the remaining batch.
+- Clicking a screenshot exposes move-up/down, alt-text/caption and remove
+  actions. Internal image drags move the existing figure and caption rather
+  than duplicating the browser's dragged HTML.
+- **Insert HTML** previews sanitized markup before inserting it at the saved
+  cursor without replacing other content. Full **HTML source** changes are
+  reported to the form immediately, so save, preview, local backups and the
+  unsaved-work guard see them without a mode switch. Rendering/saving still
+  sanitizes; scripts, event handlers, inline styles and embeds are not enabled.
+- Common safe `<b>`, `<i>` and `<strike>` tags (including browser-generated
+  toolbar formatting) are normalized to `<strong>`, `<em>` and `<s>` so the
+  backend's allow-list keeps the formatting.
+- External values are cleaned before being injected into the editor. A blank
+  source editor or a default author name does not count as added content.
 
 ---
+
+## Writing a tutorial
+
+1. Open **New post** and start writing in **Content**.
+2. Place the cursor where the screenshot belongs. Choose **Insert image** to
+   use the library or a URL (with alt text/caption), or **Upload images here** to
+   upload one or several files directly at that point. Pasting a screenshot or
+   dropping a file works too.
+3. Continue typing below the image, then repeat for the next step. Click an
+   image to move it, edit its details or remove it; dragging reorders it.
+4. Use **Insert HTML** for a snippet such as a heading, code example or table.
+   Use **HTML source** to edit the entire article. Save and reader preview work
+   in either mode, including the latest source changes.
+5. The sidebar's **Cover image** is a separate, optional listing thumbnail;
+   it is not where tutorial screenshots are arranged.
 
 ## Layout of the new code
 
@@ -193,6 +253,7 @@ src/api/blog.ts                  blog API client (routes, envelope, pagination)
 src/lib/blog.ts                  limits, slugify, formatters, state, URL and image checks
 src/lib/blog-html.ts             sanitizer + text/word/excerpt helpers
 src/lib/blog-doc.ts              HTML ↔ rich document conversion
+src/lib/blog-editor.ts           cursor-aware DOM insertion and selection bookmarks
 src/lib/blog-draft.ts            post form, localStorage backup, taxonomy memory
 src/lib/blog-images.ts           upload validation, error translation, URL import
 src/lib/routes.ts                hash routes for analytics + the CMS
@@ -203,7 +264,8 @@ src/blog/BlogEditorPage.tsx      editor orchestration
 src/blog/BlogMediaPage.tsx       media library
 src/blog/BlogCommentsPage.tsx    moderation queue
 src/blog/components/             RichTextEditor, MediaLibraryDialog, CoverImageField,
-                                 SeoPanel, PostPreviewDialog, useImageUpload, common
+                                 HtmlSnippetDialog, SeoPanel, PostPreviewDialog,
+                                 useImageUpload, common
 src/styles/blog.css              CMS styles (imported after styles.css)
 ```
 
@@ -216,7 +278,7 @@ below 1120 px with a sticky mobile action bar.
 
 ## Tests
 
-`npm test` runs Vitest in jsdom (185 tests):
+`npm test` runs Vitest in jsdom (244 tests):
 
 - `src/lib/__tests__/` — slugify/limits/formatters, schedule and URL rules,
   magic-byte image detection, the sanitizer, document conversion, drafts, routes
@@ -228,5 +290,17 @@ below 1120 px with a sticky mobile action bar.
   offline saves, the local backup, moderation with rollback, bulk runs, upload
   validation and the storage/rate-limit paths.
 - `src/blog/components/__tests__/RichTextEditor.test.tsx` — hydration, typing,
-  empty-markup reporting, image insertion, source mode, disabled and invalid
-  states.
+  empty-markup reporting, cursor placement, image ordering/reordering and
+  details, clipboard/drop uploads, asynchronous insertion and focus, failed
+  queues, HTML snippet previews, immediate source reporting, disabled and
+  invalid states. Editor-page regressions also cover saving/previewing/backing
+  up source edits, missing versus deleted endpoints and StrictMode hydration.
+- `src/lib/__tests__/blog-editor.test.ts` — splitting paragraphs, preserving
+  inline formatting, list/table containers, mixed HTML, detached ranges and
+  cursor bookmarks.
+
+Browser smoke testing against the empty mock API covers first-use states,
+typing → uploading → continued typing → another screenshot, alt/caption edits,
+image repositioning, HTML snippets/preview, source-mode saves, reload under
+StrictMode, a 390 px viewport and a missing CMS route. Uploaded mock-media bytes
+are served directly (not JSON-serialized), so previews test real image rendering.
