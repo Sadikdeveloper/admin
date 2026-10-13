@@ -51,17 +51,66 @@ export const session = {
 };
 
 /**
+ * A failed API call. `message` is always safe to show an operator, while
+ * `serverMessages` keeps the raw details so forms can point at the exact field
+ * the server rejected (Nest returns validation failures as an array).
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly serverMessages: string[];
+
+  constructor(message: string, status = 0, serverMessages: string[] = []) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.serverMessages = serverMessages;
+  }
+}
+
+/** True when the failure was a network/timeout problem rather than a server reply. */
+export function isNetworkError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 0;
+}
+
+function serverMessagesOf(body: unknown): string[] {
+  if (!body || typeof body !== 'object') return [];
+  const record = body as { message?: unknown; error?: unknown };
+  if (Array.isArray(record.message)) {
+    return record.message.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+  }
+  if (typeof record.message === 'string' && record.message.trim()) return [record.message.trim()];
+  if (typeof record.error === 'string' && record.error.trim()) return [record.error.trim()];
+  return [];
+}
+
+/** Keeps short, human-readable server messages and drops stack-trace style noise. */
+function readableMessages(messages: string[], limit = 3): string {
+  const usable = messages
+    .map(message => message.trim())
+    .filter(message => message.length > 0 && message.length < 160 && !/[{}\[\]]|stack|trace|\bat \w+\.\w+/i.test(message));
+  if (!usable.length) return '';
+  const shown = usable.slice(0, limit);
+  const extra = usable.length - shown.length;
+  return shown.join(' · ') + (extra > 0 ? ` (+${extra} more)` : '');
+}
+
+/**
  * Converts technical error messages from the server into
  * plain, friendly text the operator can act on.
  */
-function friendlyApiError(status: number, serverMessage: string | undefined): string {
+function friendlyApiError(status: number, messages: string[]): string {
+  const serverMessage = messages[0];
   const msg = (serverMessage || '').toLowerCase();
 
   switch (status) {
     case 400:
       if (/nonce|challenge|signature|sign/i.test(msg))
         return 'Something went wrong verifying your wallet. Please try connecting again.';
-      return 'We couldn\'t process your request. Please check what you entered and try again.';
+      // Validation failures are actionable, so pass the server's own wording through.
+      return (
+        readableMessages(messages) ||
+        'We couldn\'t process your request. Please check what you entered and try again.'
+      );
 
     case 401:
       if (/expired|token|session/i.test(msg))
@@ -80,7 +129,11 @@ function friendlyApiError(status: number, serverMessage: string | undefined): st
       return 'The request took too long to complete. Please check your internet connection and try again.';
 
     case 409:
-      return 'There\'s a conflict with the current data. Please refresh the page and try again.';
+      // Conflict details (for example a duplicate slug) are worth showing verbatim.
+      return (
+        readableMessages(messages, 1) ||
+        'There\'s a conflict with the current data. Please refresh the page and try again.'
+      );
 
     case 422:
       return 'The information provided isn\'t quite right. Please double-check and try again.';
@@ -88,17 +141,24 @@ function friendlyApiError(status: number, serverMessage: string | undefined): st
     case 429:
       return 'You\'re making requests a bit too quickly. Please wait a moment and try again.';
 
+    case 503:
+      // A 503 usually carries the real reason (maintenance, or a feature whose
+      // backing service isn't configured), so keep it when it reads cleanly.
+      return (
+        readableMessages(messages, 1) ||
+        'Our servers are having trouble right now. Please wait a minute and try again. If the problem persists, let the team know.'
+      );
+
     case 500:
     case 502:
-    case 503:
     case 504:
       return 'Our servers are having trouble right now. Please wait a minute and try again. If the problem persists, let the team know.';
 
     default:
-      if (serverMessage && serverMessage.length < 120 && !/\{|\[|stack|trace/i.test(serverMessage)) {
-        return serverMessage;
-      }
-      return `Something went wrong (error ${status}). Please try again in a moment.`;
+      return (
+        readableMessages(messages, 1) ||
+        `Something went wrong (error ${status}). Please try again in a moment.`
+      );
   }
 }
 
@@ -111,14 +171,19 @@ function unwrap<T>(body: { data?: T } | T | null | undefined): T {
 
 async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set('Content-Type', 'application/json');
+  // Multipart bodies carry their own boundary, so forcing a JSON content type
+  // here would make the server reject the upload.
+  const isMultipart = typeof FormData !== 'undefined' && init.body instanceof FormData;
+  if (!isMultipart) headers.set('Content-Type', 'application/json');
   if (session.access) headers.set('Authorization', `Bearer ${session.access}`);
 
   let response: Response;
   try {
     response = await fetch(`${apiBase}${path}`, { ...init, headers });
   } catch {
-    throw new Error("We can't reach the Rown server right now. Please check your internet connection and try again.");
+    throw new ApiError(
+      "We can't reach the Rown server right now. Please check your internet connection and try again.",
+    );
   }
 
   if (response.status === 401 && retry && session.refresh) {
@@ -128,16 +193,20 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
       return request<T>(path, init, false);
     } catch {
       session.clear();
-      throw new Error('Your session has expired. Please sign in again to continue.');
+      throw new ApiError('Your session has expired. Please sign in again to continue.', 401);
     }
   }
 
   const body = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(friendlyApiError(response.status, body?.message));
+    const messages = serverMessagesOf(body);
+    throw new ApiError(friendlyApiError(response.status, messages), response.status, messages);
   }
   return body as T;
 }
+
+/* Shared with the feature API clients (for example src/api/blog.ts). */
+export { request as apiFetch, unwrap as unwrapData };
 
 export async function getNonce(address: string) {
   const result = await request<{ data: { message: string } } | { message: string }>('/admin/auth/nonce', { method: 'POST', body: JSON.stringify({ address }) });

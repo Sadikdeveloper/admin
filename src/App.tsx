@@ -6,17 +6,28 @@ import {
   BarChart3,
   CircleAlert,
   Copy,
+  Image as ImageIcon,
   LogOut,
+  MessageSquare,
+  Newspaper,
   PlugZap,
   RefreshCw,
   Users,
   Wallet,
 } from 'lucide-react';
 import * as api from './api';
+import * as blogApi from './api/blog';
 import { DEFAULT_PERIOD, shortAddress } from './lib/format';
-import { PAGES } from './types';
+import { navGuard } from './lib/nav-guard';
+import { isAnalyticsRoute, parseRoute, routeToHash, routesEqual } from './lib/routes';
+import type { Route, RouteName } from './lib/routes';
 import type { BrowserWallet, Page } from './types';
 import { Banner } from './components/ui';
+import { ConfirmDialog } from './components/ConfirmDialog';
+import { BlogPostsPage } from './blog/BlogPostsPage';
+import { BlogEditorPage } from './blog/BlogEditorPage';
+import { BlogMediaPage } from './blog/BlogMediaPage';
+import { BlogCommentsPage } from './blog/BlogCommentsPage';
 import { SignInPage } from './pages/SignInPage';
 import { OverviewPage } from './pages/OverviewPage';
 import { MoneyAnalyticsPage } from './pages/MoneyAnalyticsPage';
@@ -73,19 +84,36 @@ function copyToClipboard(text: string): Promise<void> {
   return Promise.resolve();
 }
 
-const NAV: { page: Page; label: string; icon: ReactNode }[] = [
-  { page: 'overview', label: 'Overview', icon: <BarChart3 size={17} /> },
-  { page: 'transactions', label: 'Transactions', icon: <Activity size={17} /> },
-  { page: 'deposits', label: 'Deposits', icon: <ArrowDownLeft size={17} /> },
-  { page: 'topups', label: 'Top-ups', icon: <Wallet size={17} /> },
-  { page: 'providers', label: 'Providers', icon: <PlugZap size={17} /> },
-  { page: 'users', label: 'Users', icon: <Users size={17} /> },
-];
+type NavItem = { key: string; label: string; icon: ReactNode; route: Route; activeOn: RouteName[] };
 
-function pageFromHash(): Page {
-  const hash = window.location.hash.replace('#/', '').replace('#', '') as Page;
-  return PAGES.includes(hash) ? hash : 'overview';
-}
+const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
+  {
+    label: 'Analytics',
+    items: [
+      { key: 'overview', label: 'Overview', icon: <BarChart3 size={17} />, route: { name: 'overview' }, activeOn: ['overview'] },
+      { key: 'transactions', label: 'Transactions', icon: <Activity size={17} />, route: { name: 'transactions' }, activeOn: ['transactions'] },
+      { key: 'deposits', label: 'Deposits', icon: <ArrowDownLeft size={17} />, route: { name: 'deposits' }, activeOn: ['deposits'] },
+      { key: 'topups', label: 'Top-ups', icon: <Wallet size={17} />, route: { name: 'topups' }, activeOn: ['topups'] },
+      { key: 'providers', label: 'Providers', icon: <PlugZap size={17} />, route: { name: 'providers' }, activeOn: ['providers'] },
+      { key: 'users', label: 'Users', icon: <Users size={17} />, route: { name: 'users' }, activeOn: ['users'] },
+    ],
+  },
+  {
+    label: 'Content',
+    items: [
+      {
+        key: 'blog',
+        label: 'Blog',
+        icon: <Newspaper size={17} />,
+        route: { name: 'blog' },
+        // The editor is part of the blog section, so it keeps that item lit.
+        activeOn: ['blog', 'blog-editor'],
+      },
+      { key: 'blog-media', label: 'Media', icon: <ImageIcon size={17} />, route: { name: 'blog-media' }, activeOn: ['blog-media'] },
+      { key: 'blog-comments', label: 'Comments', icon: <MessageSquare size={17} />, route: { name: 'blog-comments' }, activeOn: ['blog-comments'] },
+    ],
+  },
+];
 
 function isMobileBrowser(): boolean {
   const ua = navigator.userAgent;
@@ -153,7 +181,16 @@ export default function App() {
   const [busyWalletId, setBusyWalletId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
 
-  const [activePage, setActivePage] = useState<Page>(() => pageFromHash());
+  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.hash));
+  const [guardPrompt, setGuardPrompt] = useState<string | null>(null);
+  const [pendingComments, setPendingComments] = useState<number | null>(null);
+
+  /* Navigation is veto-able: the blog editor registers a guard while a draft
+     has unsaved work, and a hash change (back button, typed URL) honours it. */
+  const pendingNav = useRef<{ next: Route; hashChanged: boolean } | null>(null);
+  const suppressHashChange = useRef(false);
+  const routeRef = useRef(route);
+  routeRef.current = route;
 
   /* One range control per page keeps each view's context when switching tabs. */
   const [range, setRange] = useState<Record<Page, string>>({
@@ -380,26 +417,117 @@ export default function App() {
     };
   }, []);
 
-  /* Load whatever page is active once we have a session. */
+  /* Load whatever analytics page is active once we have a session. Blog screens
+     fetch for themselves, so they are deliberately skipped here. */
   useEffect(() => {
     if (!admin) return;
-    ensureLoaded(activePage);
-  }, [admin, activePage, ensureLoaded]);
+    if (isAnalyticsRoute(route)) ensureLoaded(route.name);
+  }, [admin, route, ensureLoaded]);
 
   /* Keep the URL hash in sync so pages are linkable and the back button works. */
   useEffect(() => {
     if (!admin) return;
-    const onHashChange = () => setActivePage(pageFromHash());
+    const onHashChange = () => {
+      if (suppressHashChange.current) {
+        suppressHashChange.current = false;
+        return;
+      }
+      const next = parseRoute(window.location.hash);
+      if (routesEqual(next, routeRef.current)) {
+        setRoute(next);
+        return;
+      }
+      const message = navGuard.check(next);
+      if (message) {
+        pendingNav.current = { next, hashChanged: true };
+        setGuardPrompt(message);
+        return;
+      }
+      setError('');
+      setNotice('');
+      setRoute(next);
+    };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, [admin]);
 
+  const setHash = useCallback((next: Route) => {
+    const hash = routeToHash(next);
+    if (window.location.hash === hash) return;
+    // We already know where we are going, so ignore the event we are about to cause.
+    suppressHashChange.current = true;
+    window.location.hash = hash;
+  }, []);
+
+  const navigate = useCallback(
+    (next: Route) => {
+      if (routesEqual(next, routeRef.current)) return;
+      const message = navGuard.check(next);
+      if (message) {
+        pendingNav.current = { next, hashChanged: false };
+        setGuardPrompt(message);
+        return;
+      }
+      setError('');
+      setNotice('');
+      setHash(next);
+      setRoute(next);
+    },
+    [setHash],
+  );
+
   function navigateTo(page: Page) {
-    setActivePage(page);
+    navigate({ name: page });
+  }
+
+  function confirmLeave() {
+    const pending = pendingNav.current;
+    pendingNav.current = null;
+    setGuardPrompt(null);
+    navGuard.clear();
+    if (!pending) return;
     setError('');
     setNotice('');
-    if (window.location.hash !== `#/${page}`) window.location.hash = `#/${page}`;
+    setHash(pending.next);
+    setRoute(pending.next);
   }
+
+  function cancelLeave() {
+    const pending = pendingNav.current;
+    pendingNav.current = null;
+    setGuardPrompt(null);
+    // Undo a back-button/typed-hash jump that the guard refused.
+    if (pending?.hashChanged) setHash(routeRef.current);
+  }
+
+  /* Moderation queue badge — tiny requests, and purely decorative if they fail. */
+  useEffect(() => {
+    if (!admin) return;
+    let alive = true;
+    const load = () => {
+      blogApi
+        .listComments({ status: 'PENDING', page: 1, limit: 1 })
+        .then(result => {
+          if (alive) setPendingComments(result.pagination.total);
+        })
+        .catch(() => {
+          /* the badge is a convenience, never an error surface */
+        });
+    };
+    load();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 90_000);
+    const refresh = () => load();
+    window.addEventListener('rown:blog-comments-changed', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      window.removeEventListener('rown:blog-comments-changed', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [admin]);
 
   /* ---- Search ---- */
 
@@ -493,7 +621,9 @@ export default function App() {
       setTxQuery('');
       setError('');
       setNotice('');
-      setActivePage('overview');
+      setPendingComments(null);
+      navGuard.clear();
+      setRoute({ name: 'overview' });
     }
   }
 
@@ -540,17 +670,31 @@ export default function App() {
         </div>
 
         <nav className="side-nav" aria-label="Console sections">
-          {NAV.map(item => (
-            <button
-              key={item.page}
-              type="button"
-              className={activePage === item.page ? 'active' : ''}
-              aria-current={activePage === item.page ? 'page' : undefined}
-              onClick={() => navigateTo(item.page)}
-            >
-              {item.icon}
-              {item.label}
-            </button>
+          {NAV_GROUPS.map(group => (
+            <div className="side-nav-group" key={group.label}>
+              <span className="side-nav-label">{group.label}</span>
+              {group.items.map(item => {
+                const active = item.activeOn.includes(route.name);
+                const badge = item.key === 'blog-comments' && pendingComments ? pendingComments : null;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    className={active ? 'active' : ''}
+                    aria-current={active ? 'page' : undefined}
+                    onClick={() => navigate(item.route)}
+                  >
+                    {item.icon}
+                    {item.label}
+                    {badge ? (
+                      <span className="nav-badge" title={`${badge} comment${badge === 1 ? '' : 's'} waiting for moderation`}>
+                        {badge > 99 ? '99+' : badge}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
+            </div>
           ))}
         </nav>
 
@@ -581,7 +725,7 @@ export default function App() {
         {notice && <Banner tone="info" message={notice} onDismiss={() => setNotice('')} />}
         {error && <Banner tone="error" message={error} onDismiss={() => setError('')} />}
 
-        {activePage === 'overview' && (
+        {route.name === 'overview' && (
           <OverviewPage
             overview={overview}
             loading={busy.overview}
@@ -603,7 +747,7 @@ export default function App() {
           />
         )}
 
-        {activePage === 'transactions' && (
+        {route.name === 'transactions' && (
           <MoneyAnalyticsPage
             data={moneyPages.transactions.data}
             loading={busy.transactions}
@@ -629,7 +773,7 @@ export default function App() {
           />
         )}
 
-        {activePage === 'deposits' && (
+        {route.name === 'deposits' && (
           <MoneyAnalyticsPage
             data={moneyPages.deposits.data}
             loading={busy.deposits}
@@ -644,7 +788,7 @@ export default function App() {
           />
         )}
 
-        {activePage === 'topups' && (
+        {route.name === 'topups' && (
           <MoneyAnalyticsPage
             data={moneyPages.topups.data}
             loading={busy.topups}
@@ -659,7 +803,7 @@ export default function App() {
           />
         )}
 
-        {activePage === 'providers' && (
+        {route.name === 'providers' && (
           <ProvidersPage
             data={providerData}
             loading={busy.providers}
@@ -669,7 +813,7 @@ export default function App() {
           />
         )}
 
-        {activePage === 'users' && (
+        {route.name === 'users' && (
           <UsersPage
             data={userData}
             loading={busy.users}
@@ -678,7 +822,36 @@ export default function App() {
             onRefresh={loadUsers}
           />
         )}
+
+        {route.name === 'blog' && <BlogPostsPage onNavigate={navigate} />}
+
+        {route.name === 'blog-editor' && (
+          <BlogEditorPage postId={route.postId} adminLabel={admin.label} onNavigate={navigate} />
+        )}
+
+        {route.name === 'blog-media' && <BlogMediaPage />}
+
+        {route.name === 'blog-comments' && <BlogCommentsPage onNavigate={navigate} />}
       </main>
+
+      <ConfirmDialog
+        open={Boolean(guardPrompt)}
+        title="Leave with unsaved changes?"
+        message={
+          <>
+            <p>{guardPrompt}</p>
+            <p className="confirm-hint">
+              A copy stays in this browser, so nothing is lost on this device — but the post will not be saved on the
+              server until you come back and save it.
+            </p>
+          </>
+        }
+        confirmLabel="Leave anyway"
+        cancelLabel="Stay and keep editing"
+        tone="primary"
+        onConfirm={confirmLeave}
+        onCancel={cancelLeave}
+      />
     </div>
   );
 }
