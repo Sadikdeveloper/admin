@@ -152,13 +152,13 @@ export function BlogCommentsPage({ onNavigate }: { onNavigate: (route: Route) =>
       } catch (e) {
         setComments(previous);
         const message =
-          e instanceof ApiError && e.status === 404
+          e instanceof ApiError && e.status === 404 && !(e instanceof blogApi.BlogEndpointError)
             ? 'That comment no longer exists — it was probably deleted by another operator.'
             : e instanceof Error
               ? e.message
               : 'The comment could not be updated.';
         toast.error(message);
-        if (e instanceof ApiError && e.status === 404) void load(status, page, limit);
+        if (e instanceof ApiError && e.status === 404 && !(e instanceof blogApi.BlogEndpointError)) void load(status, page, limit);
       } finally {
         setBusyId(null);
       }
@@ -182,7 +182,7 @@ export function BlogCommentsPage({ onNavigate }: { onNavigate: (route: Route) =>
       } catch (e) {
         setComments(previous);
         toast.error(
-          e instanceof ApiError && e.status === 404
+          e instanceof ApiError && e.status === 404 && !(e instanceof blogApi.BlogEndpointError)
             ? 'That comment was already deleted.'
             : e instanceof Error
               ? e.message

@@ -168,3 +168,19 @@ describe('cleanEditorHtml', () => {
     expect(cleanEditorHtml(undefined)).toBe('');
   });
 });
+
+
+describe('safe HTML aliases', () => {
+  it('preserves common HTML and browser-generated formatting using backend-compatible tags', () => {
+    expect(sanitizeBlogHtml('<p><b>Bold</b> <i>Italic</i> <strike>Gone</strike></p>')).toBe('<p><strong>Bold</strong> <em>Italic</em> <s>Gone</s></p>');
+  });
+
+  it('does not preserve unsafe attributes when normalizing a tag', () => {
+    expect(sanitizeBlogHtml('<b class="lead" onclick="bad()" style="color:red"><i>Safe</i><script>bad()</script></b>')).toBe('<strong class="lead"><em>Safe</em></strong>');
+  });
+});
+
+
+it('does not treat an unknown tag named after an Object property as an HTML alias', () => {
+  expect(sanitizeBlogHtml('<constructor><b>Safe</b><script>bad()</script></constructor>')).toBe('<strong>Safe</strong>');
+});

@@ -1152,6 +1152,7 @@
 .editor-main,
 .editor-side {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 13px;
   min-width: 0;
 }
@@ -1485,6 +1486,7 @@
 
 .seo-panel {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
 }
 
@@ -1665,7 +1667,6 @@
   pointer-events: none;
 }
 
-.rte-busy-overlay,
 .rte-drop-overlay {
   position: absolute;
   inset: 0;
@@ -1679,12 +1680,6 @@
   font-size: 12.5px;
   font-weight: 600;
   border-radius: 12px;
-}
-
-.rte-busy-overlay {
-  z-index: 3;
-  color: var(--ink-soft);
-  background: rgba(255, 255, 255, 0.78);
 }
 
 .rte-drop-overlay {
@@ -3049,3 +3044,75 @@
     transition: none;
   }
 }
+
+/* Keep insertion actions visible rather than hiding them among format icons. */
+.rte-insert-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rte-insert-bar .active {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.rte-insert-hint {
+  margin: 0;
+  padding: 10px 14px;
+  color: var(--muted);
+  background: #fbfafc;
+  font-size: 12px;
+  line-height: 1.6;
+  border-bottom: 1px solid var(--line);
+}
+
+.rte-upload-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  color: var(--ink-soft);
+  background: var(--accent-soft);
+  font-size: 12px;
+}
+
+.rte-html-input {
+  min-height: 190px;
+  font: 400 13px/1.7 var(--mono);
+}
+
+.rte-html-preview {
+  max-height: 300px;
+  overflow: auto;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+@media (max-width: 620px) {
+  .rte-insert-bar .btn { min-height: 42px; }
+  .rte-html-input { font-size: 16px; }
+}
+
+.rte-image-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--accent-soft);
+  border-top: 1px solid var(--line);
+}
+
+.rte-image-actions > span {
+  margin-right: 5px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.rte-surface img { cursor: pointer; }

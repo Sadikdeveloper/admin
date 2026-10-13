@@ -137,30 +137,41 @@ export function BlogPostsPage({ onNavigate }: { onNavigate: (route: Route) => vo
       setLoading(true);
       setError(null);
       try {
-        const [list, published, drafts] = await Promise.all([
+        const [list, countResults] = await Promise.all([
           blogApi.listPosts({
             page: targetPage,
             limit: PAGE_SIZE,
             status: targetStatus === 'ALL' ? undefined : targetStatus,
             search: targetSearch || undefined,
           }),
-          blogApi.listPosts({ page: 1, limit: 1, status: 'PUBLISHED' }),
-          blogApi.listPosts({ page: 1, limit: 1, status: 'DRAFT' }),
+          // Counts are decoration. A failed/empty status probe must not turn
+          // a successful post list into a misleading "not found" screen.
+          Promise.allSettled([
+            blogApi.listPosts({ page: 1, limit: 1, status: 'PUBLISHED' }),
+            blogApi.listPosts({ page: 1, limit: 1, status: 'DRAFT' }),
+          ]),
         ]);
         // A slower response for an older filter must not overwrite a newer one.
         if (seq !== requestSeq.current) return;
+        const lastPage = Math.max(1, list.pagination.totalPages);
+        if (targetPage > lastPage) {
+          setPage(lastPage);
+          return;
+        }
         setPosts(list.items);
         setTotal(list.pagination.total);
-        setTotalPages(list.pagination.totalPages);
-        setCounts({
-          published: published.pagination.total,
-          drafts: drafts.pagination.total,
-          all: published.pagination.total + drafts.pagination.total,
-        });
+        setTotalPages(lastPage);
+        const [published, drafts] = countResults;
+        setCounts(published.status === 'fulfilled' && drafts.status === 'fulfilled' ? {
+          published: published.value.pagination.total,
+          drafts: drafts.value.pagination.total,
+          all: published.value.pagination.total + drafts.value.pagination.total,
+        } : null);
       } catch (e) {
         if (seq !== requestSeq.current) return;
         setPosts([]);
         setTotal(0);
+        setCounts(null);
         setError(e instanceof Error ? e.message : 'The blog posts could not be loaded.');
       } finally {
         if (seq === requestSeq.current) setLoading(false);
@@ -262,7 +273,7 @@ export function BlogPostsPage({ onNavigate }: { onNavigate: (route: Route) => vo
       window.dispatchEvent(new Event('rown:blog-changed'));
     } catch (e) {
       const message =
-        e instanceof ApiError && e.status === 404
+        e instanceof ApiError && e.status === 404 && !(e instanceof blogApi.BlogEndpointError)
           ? 'That post was already deleted. The list has been refreshed.'
           : e instanceof Error
             ? e.message

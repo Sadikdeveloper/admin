@@ -1,4 +1,4 @@
-import { apiFetch, unwrapData } from '../api';
+import { ApiError, apiFetch, unwrapData } from '../api';
 
 /* ------------------------------------------------------------------ */
 /* Types — these mirror the backend blog module (see docs/blog-module.md) */
@@ -119,9 +119,53 @@ function jsonBody(input: BlogPostInput): RequestInit {
   return { body: JSON.stringify(input) };
 }
 
+/** A missing API route is a setup problem, not a deleted article. */
+export class BlogEndpointError extends ApiError {
+  constructor(path: string, serverMessages: string[] = []) {
+    super(
+      `The content management API is unavailable on this server (${path.split('?')[0]}). Check that the blog module is deployed and the API URL or /admin proxy points to the backend. This does not mean your content was deleted.`,
+      404,
+      serverMessages,
+    );
+    this.name = 'BlogEndpointError';
+  }
+}
+
 /** Unwraps the `{ status, message, data }` envelope every blog route returns. */
 async function get<T>(path: string, init: RequestInit = {}): Promise<T> {
-  return unwrapData<T>(await apiFetch<{ data?: T } | T>(path, init));
+  try {
+    return unwrapData<T>(await apiFetch<{ data?: T } | T>(path, init));
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404 &&
+      (error.serverMessages.some(message => /^Cannot (?:GET|POST|PATCH|DELETE)\b/i.test(message)) ||
+        init.method && /^\/admin\/blog\/(posts|media)$/.test(path))) {
+      throw new BlogEndpointError(path, error.serverMessages);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Some older APIs return a 404 with an explicit "No posts found" message for
+ * an empty collection. Accept that narrowly, but never hide a missing route,
+ * a wrong proxy target or an ambiguous 404 as an apparently empty CMS.
+ */
+async function collection<T>(
+  path: string,
+  resource: 'posts' | 'media' | 'comments',
+  params: { page?: number; limit?: number },
+): Promise<Paged<T>> {
+  try {
+    return normalizePage<T>(await get<unknown>(path), params);
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.status !== 404 || error instanceof BlogEndpointError) throw error;
+    const noun = resource === 'media' ? '(?:media(?: assets)?|assets|images)' : resource;
+    const emptyMessage = new RegExp(`^(?:no (?:blog )?${noun}(?: (?:were|are))? (?:found|available)(?: for [^/]+)?|(?:blog )?${noun} not found)[.!]?$`, 'i');
+    if (error.serverMessages.some(message => emptyMessage.test(message.trim()))) {
+      return normalizePage<T>(null, params);
+    }
+    throw new BlogEndpointError(path, error.serverMessages);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -129,10 +173,11 @@ async function get<T>(path: string, init: RequestInit = {}): Promise<T> {
 /* ------------------------------------------------------------------ */
 
 export async function listPosts(params: BlogPostListParams = {}): Promise<Paged<BlogPost>> {
-  const page = await get<Paged<BlogPost>>(
+  return collection<BlogPost>(
     `/admin/blog/posts${query({ page: params.page, limit: params.limit, status: params.status, search: params.search })}`,
+    'posts',
+    params,
   );
-  return normalizePage<BlogPost>(page);
 }
 
 export async function getPost(id: string): Promise<BlogPost> {
@@ -168,8 +213,7 @@ export async function deletePost(id: string): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 export async function listMedia(params: { page?: number; limit?: number } = {}): Promise<Paged<BlogMediaAsset>> {
-  const page = await get<Paged<BlogMediaAsset>>(`/admin/blog/media${query({ page: params.page, limit: params.limit })}`);
-  return normalizePage<BlogMediaAsset>(page);
+  return collection<BlogMediaAsset>(`/admin/blog/media${query({ page: params.page, limit: params.limit })}`, 'media', params);
 }
 
 /**
@@ -190,10 +234,11 @@ export async function uploadMedia(file: File | Blob, filename?: string): Promise
 /* ------------------------------------------------------------------ */
 
 export async function listComments(params: BlogCommentListParams = {}): Promise<Paged<BlogComment>> {
-  const page = await get<Paged<BlogComment>>(
+  return collection<BlogComment>(
     `/admin/blog/comments${query({ page: params.page, limit: params.limit, status: params.status })}`,
+    'comments',
+    params,
   );
-  return normalizePage<BlogComment>(page);
 }
 
 export async function moderateComment(id: string, status: BlogCommentStatus): Promise<BlogComment> {
@@ -216,7 +261,7 @@ export async function deleteComment(id: string): Promise<void> {
  * deployment could hand back a bare array. Normalising here keeps every screen
  * able to render instead of crashing on `pagination.total`.
  */
-function normalizePage<T>(value: unknown): Paged<T> {
+function normalizePage<T>(value: unknown, requested: { page?: number; limit?: number } = {}): Paged<T> {
   if (Array.isArray(value)) {
     return {
       items: value as T[],
@@ -233,17 +278,17 @@ function normalizePage<T>(value: unknown): Paged<T> {
   const page = (value ?? {}) as Partial<Paged<T>>;
   const items = Array.isArray(page.items) ? page.items : [];
   const pagination = page.pagination ?? ({} as Pagination);
-  const limit = Number.isFinite(pagination.limit) && pagination.limit > 0 ? pagination.limit : items.length || 20;
+  const limit = Number.isFinite(pagination.limit) && pagination.limit > 0 ? pagination.limit : requested.limit || items.length || 20;
   const total = Number.isFinite(pagination.total) ? pagination.total : items.length;
   return {
     items,
     pagination: {
-      page: Number.isFinite(pagination.page) ? pagination.page : 1,
+      page: Number.isFinite(pagination.page) && pagination.page > 0 ? pagination.page : requested.page || 1,
       limit,
       total,
-      totalPages: Number.isFinite(pagination.totalPages)
+      totalPages: Math.max(1, Number.isFinite(pagination.totalPages)
         ? pagination.totalPages
-        : Math.max(1, Math.ceil(total / limit)),
+        : Math.ceil(total / limit)),
       hasNextPage: Boolean(pagination.hasNextPage ?? false),
       hasPreviousPage: Boolean(pagination.hasPreviousPage ?? false),
     },

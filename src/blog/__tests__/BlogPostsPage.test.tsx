@@ -331,3 +331,49 @@ describe('BlogPostsPage · row actions', () => {
     expect(within(dialog).getByText('Rown Pay is live')).toBeTruthy();
   });
 });
+
+
+describe('BlogPostsPage · first-use and optional counts', () => {
+  it('still offers the first-post action if only the count requests return 404', async () => {
+    const implementation = vi.mocked(blogApi.listPosts).getMockImplementation()!;
+    pool = [];
+    vi.mocked(blogApi.listPosts).mockImplementation(params => {
+      if (params?.limit === 1) return Promise.reject(new ApiError('Not found', 404));
+      return implementation(params);
+    });
+    const { onNavigate } = renderPage();
+    expect(await screen.findByText(/no blog posts yet/i)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /create a post/i }));
+    expect(onNavigate).toHaveBeenCalledWith({ name: 'blog-editor', postId: null });
+  });
+
+  it('keeps a valid non-empty list when a status count probe fails', async () => {
+    const implementation = vi.mocked(blogApi.listPosts).getMockImplementation()!;
+    vi.mocked(blogApi.listPosts).mockImplementation(params => {
+      if (params?.limit === 1 && params.status === 'DRAFT') return Promise.reject(new ApiError('Count unavailable', 404));
+      return implementation(params);
+    });
+    renderPage();
+    expect(await screen.findByText('Rown Pay is live')).toBeTruthy();
+    expect(rows()).toHaveLength(3);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('shows a setup-specific message for missing CMS routes, not a removed-content message', async () => {
+    stubList({ error: new blogApi.BlogEndpointError('/admin/blog/posts') });
+    renderPage();
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('content management API is unavailable'));
+    expect(screen.queryByText(/we couldn't find what you were looking for/i)).toBeNull();
+    expect(screen.queryByText(/no blog posts yet/i)).toBeNull();
+    expect(screen.getByRole('button', { name: /new post/i })).toBeTruthy();
+  });
+
+  it('returns to page one if an old stored page points into a now-empty blog', async () => {
+    pool = [];
+    sessionStorage.setItem('rown.blog.posts.view', JSON.stringify({ status: 'ALL', search: '', page: 5 }));
+    renderPage();
+    expect(await screen.findByText(/no blog posts yet/i)).toBeTruthy();
+    expect(sessionStorage.getItem('rown.blog.posts.view')).toContain('"page":1');
+  });
+});
